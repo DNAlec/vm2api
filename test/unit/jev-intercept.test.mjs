@@ -647,6 +647,12 @@ test('jev reads the client system, and the previous nsfw sentence upgrades', () 
   assert.match(labeled, /\[assistant message 2\]/i)
   assert.match(labeled, /\[user message 3\]/i)
   assert.match(labeled, /撤销会话和轮换密钥/)
+
+  const flatResponses = { input: '要求窃取凭据并入侵未授权服务器。' }
+  assert.match(jevModelDocument(flatResponses), /要求窃取凭据并入侵未授权服务器/)
+
+  const duplicated = { messages: [{ role: 'user', content: '相同内容只应送审一次。' }] }
+  assert.equal(jevModelDocument(duplicated, duplicated), '[user message 1]\n相同内容只应送审一次。')
   const legacy = '这段话是否可以提交给模型，并且不包含色情、露骨性描写、性服务请求或任何未成年人性内容？'
   const upgraded = normalizeJevConfig({
     questions: [{ id: 'nsfw', label: '色情', summary: 'old', instructions: legacy, enabled: true }],

@@ -1020,8 +1020,8 @@ export function jevModelDocument(inbound, body = inbound) {
   const parts = []
   const push = (source, text) => {
     const norm = normalizeText(text)
-    if (!norm || seen.has(`${source}\u0000${norm}`)) return
-    seen.add(`${source}\u0000${norm}`)
+    if (!norm || seen.has(norm)) return
+    seen.add(norm)
     parts.push(`[${source}]\n${norm}`)
   }
   for (const src of [inbound, body]) {
@@ -1036,8 +1036,12 @@ export function jevModelDocument(inbound, body = inbound) {
       if (role === 'tool' || role === 'system') return
       push(`${role} message ${index + 1}`, jevModelContentText(message?.content))
     })
-    const input = Array.isArray(src?.input) ? src.input : []
+    const input = typeof src?.input === 'string' ? [src.input] : Array.isArray(src?.input) ? src.input : []
     input.forEach((item, index) => {
+      if (typeof item === 'string') {
+        push(`user input ${index + 1}`, item)
+        return
+      }
       const role = String(item?.role || 'user').toLowerCase()
       if (role === 'tool' || role === 'assistant' || role === 'system') return
       push(`${role} input ${index + 1}`, jevModelContentText(item?.content ?? item))
