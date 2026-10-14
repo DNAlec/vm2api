@@ -1033,7 +1033,7 @@ export function jevModelDocument(inbound, body = inbound) {
     const messages = Array.isArray(src?.messages) ? src.messages : []
     messages.forEach((message, index) => {
       const role = String(message?.role || 'unknown').toLowerCase()
-      if (role === 'tool' || role === 'system') return
+      if (role === 'tool' || role === 'function' || role === 'assistant' || role === 'system') return
       push(`${role} message ${index + 1}`, jevModelContentText(message?.content))
     })
     const input = typeof src?.input === 'string' ? [src.input] : Array.isArray(src?.input) ? src.input : []
