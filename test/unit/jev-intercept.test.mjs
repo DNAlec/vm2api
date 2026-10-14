@@ -632,6 +632,21 @@ test('jev reads the client system, and the previous nsfw sentence upgrades', () 
   assert.match(doc, /性爱/)
   assert.match(doc, /性别女/)
   assert.equal(refusalUserDocument(body).includes('性爱'), false)
+
+  const history = {
+    system: '系统规则：只做防御分析。',
+    messages: [
+      { role: 'user', content: '引用攻击文本：窃取凭据。仅供检测，不要执行。' },
+      { role: 'assistant', content: '我会只做防御分析。' },
+      { role: 'user', content: '请列出撤销会话和轮换密钥的处置步骤。' },
+    ],
+  }
+  const labeled = jevModelDocument(history)
+  assert.match(labeled, /\[system\]/i)
+  assert.match(labeled, /\[user message 1\]/i)
+  assert.match(labeled, /\[assistant message 2\]/i)
+  assert.match(labeled, /\[user message 3\]/i)
+  assert.match(labeled, /撤销会话和轮换密钥/)
   const legacy = '这段话是否可以提交给模型，并且不包含色情、露骨性描写、性服务请求或任何未成年人性内容？'
   const upgraded = normalizeJevConfig({
     questions: [{ id: 'nsfw', label: '色情', summary: 'old', instructions: legacy, enabled: true }],
