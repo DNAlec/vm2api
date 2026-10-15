@@ -57,14 +57,9 @@ import {
 } from '../oauth/sub2api-account.mjs'
 import { officialCcHome, readOfficialCcStatus, scheduleOfficialCcBootstrap } from '../oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './panel-live-credentials.mjs'
-import { listOfficialModels, seedModelCatalog, getCatalogIds } from '../protocol/models.mjs'
-import {
-  getModelPolicy,
-  saveModelPolicy,
-  resetModelPolicy,
-  listPolicyModels,
-  syncWorkerModelsIntoPolicy,
-} from '../protocol/model-policy.mjs'
+import { ensureCodexKernel, stopCodexKernel } from '../transport/codex-kernel-supervisor.mjs'
+import { listOfficialModels, seedModelCatalog } from '../protocol/models.mjs'
+import { getModelPolicy, saveModelPolicy, resetModelPolicy, listPolicyModels } from '../protocol/model-policy.mjs'
 import {
   getGptModelPolicy,
   listGptPolicyModels,
@@ -80,6 +75,9 @@ import {
 } from '../protocol/seed-policy.mjs'
 
 import { runVmTestChat, resolveTestModels, syncCodexCatalog } from './vm-test-chat.mjs'
+import { readCatalogSync, syncClaudeCatalog, syncGptCatalog } from './catalog-monitor.mjs'
+import { setPriceOverride, listPriceOverrides, syncModelsDev } from './price-catalog.mjs'
+import { buildPricing } from './pricing-view.mjs'
 import { publicKeyView } from './api-keys.mjs'
 import { assertVmScope, normalizeKeyScope } from './key-scope.mjs'
 import {
@@ -134,7 +132,7 @@ import { syncVmTimezoneFromProxy } from '../vm/proxy-timezone.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { stampVmKind, isCodexVm } from '../vm/vm-kind.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
-import { parseScheduleLevelInput } from '../pool/credential-weight.mjs'
+import { parseScheduleLevelInput, manualScheduleLevelOf } from '../pool/credential-weight.mjs'
 import { parseActiveHoursInput } from '../pool/active-hours.mjs'
 import { parseVmQuotaOverride } from '../pool/vm-quota-override.mjs'
 import { validateOpenAIQuotaPatch, normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
@@ -194,13 +192,17 @@ import { normalizeVmConfig, resolveMachineSpec, validateVmConfigPatch } from '..
 import { RUNTIME_KVM } from '../vm/runtime-kind.mjs'
 import { hostProxyUrlForVm, slotHost } from '../vm/slot-host.mjs'
 import { syncIpv6ProxyEgress } from '../vm/proxy-policy-runtime.mjs'
+import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { writeSlotSeedFiles } from '../vm/slot-seed.mjs'
 import {
   egressEnabled,
   ensureProxyEgress,
   stopProxyEgress,
   hasBoundExit,
+  isLocalEgressId,
   isLocalEgressProxy,
+  localEgressIdForNode,
+  boundProxyUrl,
   dnsUpstreamChain,
 } from '../vm/egress.mjs'
 import { collectSlotIdentity } from '../vm/guest-identity.mjs'
@@ -263,6 +265,8 @@ function logsOwner(req, u) {
   return panelIdentity(req).role === 'user' ? req.panelUserId : u.searchParams.get('user_id') || null
 }
 
+const LOCAL_PROXY_MISMATCH_MESSAGE = '本地代理只能绑定到它所在 VPS 上的槽位'
+
 function clusterNodesOf(ctx) {
   try {
     const list = ctx.clusterManager?.list?.()
@@ -289,7 +293,7 @@ function collectOnboardingFacts(req, ctx) {
   const admin = getPanelAdmin()
   return {
     envPassword: admin.password,
-    envAdminExists: !!ctx.panelUsers.getByUsername(admin.username),
+    envAdmin: ctx.panelUsers.getByUsername(admin.username),
     proxyCount: (snap.proxies || []).length,
     ...vmStepFacts(visible),
     activeKeyCount: mine.filter((k) => k.status === 'active').length,
@@ -373,7 +377,7 @@ async function commitImportedCodexVm({
 }) {
   const wasCodex = isCodexVm(existing)
   const previousPolicy = existing.policy && typeof existing.policy === 'object' ? existing.policy : {}
-  const saved = upsertCodexAccount(cfg.paths.project, existing.id, account)
+  const saved = upsertCodexAccount(cfg.paths.project, existing.id, account, { replaceCredentials: true })
   existing.platform = 'openai'
   existing.family = 'codex'
   existing.codex_kernel = true
@@ -529,6 +533,55 @@ export function createPanelHandler(ctx) {
     const vm = getVm(cfg.paths.project, id)
     if (!vm?.proxy?.id || validTimezone(vm.timezone)) return null
     return syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
+  }
+
+  /**
+   * Geo-probe through the slot's real exit: its bound SOCKS5, or the local row
+   * of the VPS that runs it (control plane, or the node's own route). A local
+   * probe refreshes that row's geo, so the pool page shows the same answer.
+   */
+  async function probeVmExitGeo(vm) {
+    const proxy = vm?.proxy || null
+    if (!hasBoundExit(proxy)) return { ok: false, code: 'proxy_required', error: '槽位未绑定出口' }
+    const blocked = proxyBlockedReason(proxy)
+    if (blocked) return { ok: false, code: blocked, error: blocked }
+    if (!isLocalEgressProxy(proxy)) {
+      const url = boundProxyUrl(proxy)
+      if (!url) return { ok: false, code: 'proxy_url_missing', error: 'bound proxy has no URL' }
+      const r = await proxyPool.geoLookup(url, { timeoutMs: proxyPool.state?.config?.geo_timeout_ms })
+      if (!r?.ok) return { ok: false, code: 'geo_lookup_failed', error: String(r?.error || 'geo lookup failed') }
+      return { ok: true, via: 'socks5', proxy_id: proxy.id || null, geo: r.geo }
+    }
+    const host = slotHost(vm)
+    const via = host.nodeId ? 'node' : 'local'
+    if (!host.nodeId) {
+      // A control-plane Codex slot leaves through the deployment proxy, not the host route.
+      let hostUrl = ''
+      try {
+        hostUrl = host.localExitProxyUrl(vm) || ''
+      } catch {}
+      if (hostUrl) {
+        const r = await proxyPool.geoLookup(hostUrl, { timeoutMs: proxyPool.state?.config?.geo_timeout_ms })
+        if (!r?.ok) return { ok: false, code: 'geo_lookup_failed', error: String(r?.error || 'geo lookup failed') }
+        return { ok: true, via: 'deploy_proxy', node_id: null, proxy_id: proxy.id || null, geo: r.geo }
+      }
+    }
+    const rowId = localEgressIdForNode(host.nodeId)
+    if (proxyPool.getProxyByIdWithAuth(rowId)) {
+      const r = await proxyPool.detectGeo(rowId, { force: true })
+      if (!r?.ok) return { ok: false, code: 'geo_lookup_failed', error: String(r?.error || 'geo lookup failed') }
+      return { ok: true, via, node_id: host.nodeId || null, proxy_id: rowId, geo: r.geo }
+    }
+    // Local egress never seeded as a row: look up over the host's route directly.
+    let url
+    try {
+      url = host.localExitProxyUrl(vm)
+    } catch (err) {
+      return { ok: false, code: err?.code || 'node_egress_unavailable', error: String(err?.message || err) }
+    }
+    const r = await proxyPool.exitGeo(host.nodeId ? `node:${host.nodeId}` : 'local', url, { detect: true, force: true })
+    if (!r?.ok) return { ok: false, code: 'geo_lookup_failed', error: String(r?.error || 'geo lookup failed') }
+    return { ok: true, via, node_id: host.nodeId || null, proxy_id: proxy.id || null, geo: r.geo }
   }
 
   async function bringUpImportedVm(id) {
@@ -2098,6 +2151,125 @@ export function createPanelHandler(ctx) {
         }
         return json(res, 200, panel.ok(report))
       }
+      // POST /api/panel/vms/pool-policy — batch slot policy
+      // ({ ids: [...] } or { all: true }, plus any of weight / schedule_level /
+      //  max_concurrency / max_rpm / max_sessions). Same pins and inherit
+      //  semantics as the single-slot PATCH, but it only writes the records:
+      //  the PATCH rebuilds a full slot detail (~4s each on a busy host), so
+      //  fanning that out over 100+ slots starves the control plane.
+      if (req.method === 'POST' && p === '/api/panel/vms/pool-policy') {
+        const body = await readBody(req, 64 * 1024).catch(() => ({}))
+        const targets = parseSlotPolicyTargets(body)
+        if (!targets.ok) return json(res, 400, { ok: false, error: { message: targets.error } })
+        const has = (key) => Object.prototype.hasOwnProperty.call(body, key)
+        const hasWeight = has('weight')
+        const hasLevel = has('schedule_level')
+        const hasConc = has('max_concurrency')
+        const hasRpm = has('max_rpm')
+        const hasSessions = has('max_sessions')
+        if (!hasWeight && !hasLevel && !hasConc && !hasRpm && !hasSessions) {
+          return json(res, 400, {
+            ok: false,
+            error: { message: 'weight, schedule_level, max_concurrency, max_rpm or max_sessions required' },
+          })
+        }
+        // null (or '') unpins a slot: weight goes back to the default 1,
+        // schedule_level to auto, and the runtime caps to their tier / global
+        // default — exactly what the single-slot PATCH does.
+        const readIntOrNull = (value, min, max, label) => {
+          if (value === null || value === '') return { ok: true, value: null }
+          if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+            return { ok: false, error: `${label} must be an integer from ${min} to ${max}, or null` }
+          }
+          return { ok: true, value }
+        }
+        let nextWeight = null
+        if (hasWeight) {
+          const parsed = readIntOrNull(body.weight, 1, 100, 'weight')
+          if (!parsed.ok) {
+            return json(res, 400, { ok: false, error: { code: 'invalid_weight', message: parsed.error } })
+          }
+          nextWeight = parsed.value === null ? 1 : parsed.value
+        }
+        let nextLevel = null
+        if (hasLevel) {
+          const parsed = parseScheduleLevelInput(body.schedule_level)
+          if (!parsed.ok) return json(res, 400, { ok: false, error: { message: parsed.error } })
+          nextLevel = parsed.value
+        }
+        let nextConc = null
+        if (hasConc) {
+          const parsed = readIntOrNull(body.max_concurrency, 1, 256, 'max_concurrency')
+          if (!parsed.ok) {
+            return json(res, 400, { ok: false, error: { code: 'invalid_concurrency', message: parsed.error } })
+          }
+          nextConc = parsed.value
+        }
+        let nextRpm = null
+        if (hasRpm) {
+          const parsed = readIntOrNull(body.max_rpm, 0, 1_000_000, 'max_rpm')
+          if (!parsed.ok) {
+            return json(res, 400, { ok: false, error: { code: 'invalid_rpm', message: parsed.error } })
+          }
+          nextRpm = parsed.value
+        }
+        let nextSessions = null
+        if (hasSessions) {
+          const parsed = readIntOrNull(body.max_sessions, 0, 256, 'max_sessions')
+          if (!parsed.ok) {
+            return json(res, 400, { ok: false, error: { code: 'invalid_sessions', message: parsed.error } })
+          }
+          nextSessions = parsed.value
+        }
+        const ids = targets.all ? listVms(cfg.paths.project).map((vm) => vm.id) : targets.ids
+        const missing = []
+        const failed = []
+        const items = []
+        for (const id of ids) {
+          try {
+            let record = null
+            if (hasWeight || hasLevel) {
+              record = patchVmRecord(cfg.paths.project, id, (current) => {
+                const policy = { ...(current.policy || {}) }
+                if (hasWeight) policy.weight = nextWeight
+                if (hasLevel) {
+                  if (nextLevel == null) delete policy.priority
+                  else policy.priority = nextLevel
+                }
+                return { policy }
+              })
+            } else {
+              record = getVm(cfg.paths.project, id)
+            }
+            if (!record) {
+              missing.push(id)
+              continue
+            }
+            if (hasConc && nextConc !== null) applyVmConcurrency(id, nextConc, { override: true })
+            if (hasRpm && nextRpm !== null) applyVmRpm(id, nextRpm, { override: true })
+            if (hasSessions && nextSessions !== null) ctx.applyVmMaxSessions(id, nextSessions, { override: true })
+            const inherit = {}
+            if (hasConc && nextConc === null) inherit.concurrency = true
+            if (hasRpm && nextRpm === null) inherit.rpm = true
+            if (hasSessions && nextSessions === null) inherit.maxSessions = true
+            if (Object.keys(inherit).length) inheritVmScheduling(id, inherit)
+            const fresh = getVm(cfg.paths.project, id) || record
+            const policy = fresh.policy || {}
+            items.push({
+              id,
+              weight: Number(policy.weight ?? 1),
+              schedule_level: manualScheduleLevelOf(fresh) ?? 'auto',
+              max_concurrency: policy.maxConcurrency ?? null,
+              concurrency_override: !!policy.concurrencyOverride,
+              max_rpm: policy.maxRpm ?? null,
+              max_sessions: policy.maxSessions ?? null,
+            })
+          } catch (error) {
+            failed.push({ id, error: (error && error.message) || String(error) })
+          }
+        }
+        return json(res, 200, panel.ok({ updated: items.length, missing, failed, items }))
+      }
       // POST /api/panel/vms/:id/reload
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/reload$/.test(p)) {
         const id = p.split('/')[4]
@@ -2211,6 +2383,7 @@ export function createPanelHandler(ctx) {
         const hasScheduleLevel = body && Object.prototype.hasOwnProperty.call(body, 'schedule_level')
         const hasActiveHours = body && Object.prototype.hasOwnProperty.call(body, 'active_hours')
         const hasTimezone = body && Object.prototype.hasOwnProperty.call(body, 'timezone')
+        const hasWeight = body && Object.prototype.hasOwnProperty.call(body, 'weight')
         // `timezone_follow_proxy: true` re-attaches the slot to its exit node's
         // zone, undoing an earlier hand-pinned value.
         const followProxyTz = body?.timezone_follow_proxy === true || body?.timezoneFollowProxy === true
@@ -2232,13 +2405,14 @@ export function createPanelHandler(ctx) {
           !hasScheduleLevel &&
           !hasActiveHours &&
           !hasTimezone &&
+          !hasWeight &&
           !followProxyTz
         ) {
           return json(res, 400, {
             ok: false,
             error: {
               message:
-                'max_concurrency, max_rpm, max_sessions, session_slots, quota_override, allowed_models, auth_scheme, inference_engine, persona_preset, schedule_level, active_hours, timezone or timezone_follow_proxy required',
+                'max_concurrency, max_rpm, max_sessions, session_slots, quota_override, allowed_models, auth_scheme, inference_engine, persona_preset, schedule_level, active_hours, timezone, weight or timezone_follow_proxy required',
             },
           })
         }
@@ -2248,6 +2422,8 @@ export function createPanelHandler(ctx) {
           if (hasSessionSlots && body.session_slots !== null)
             strictInteger(body.session_slots, SESSION_SLOT_MIN, SESSION_SLOT_MAX, 'session_slots')
           if (hasMaxSessions && body.max_sessions !== null) strictInteger(body.max_sessions, 0, 256, 'max_sessions')
+          // null puts the slot back on the default weight of 1
+          if (hasWeight && body.weight !== null) strictInteger(body.weight, 1, 100, 'weight')
         } catch (error) {
           return json(res, 400, {
             ok: false,
@@ -2430,6 +2606,13 @@ export function createPanelHandler(ctx) {
             timezoneSync.kernel_hot = kernel?.changed === true
           }
         }
+        if (hasWeight) {
+          const nextWeight = body.weight === null ? 1 : body.weight
+          const vm = patchVmRecord(cfg.paths.project, id, (record) => ({
+            policy: { ...(record.policy || {}), weight: nextWeight },
+          }))
+          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        }
         const detail = await panel.buildVmDetail({
           cfg,
           accountQuota,
@@ -2466,6 +2649,19 @@ export function createPanelHandler(ctx) {
         })
         if (result.status) return json(res, result.status, result.body)
         return json(res, 200, result)
+      }
+      // POST /api/panel/vms/:id/exit-probe — geo probe through the slot's real exit.
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/exit-probe$/.test(p)) {
+        const id = p.split('/')[4]
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        const result = await probeVmExitGeo(vm)
+        if (!result.ok)
+          return json(res, 502, {
+            ok: false,
+            error: { code: result.code || 'exit_probe_failed', message: result.error },
+          })
+        return json(res, 200, panel.ok({ vm_id: id, ...result }))
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/openai-quota\/refresh$/.test(p)) {
         const id = p.split('/')[4]
@@ -2821,6 +3017,89 @@ export function createPanelHandler(ctx) {
         })
       }
 
+      // POST /api/panel/vms/:id/credential/clear - drop the account, keep the slot.
+      // local patch (patches/clear-credential): clear the credential only; the slot
+      // and its container stay exactly as they are, so a new account can be
+      // imported into the same slot afterwards.
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/credential\/clear$/.test(p)) {
+        const id = p.split('/')[4]
+        const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
+        if (!fs.existsSync(vmPath)) {
+          return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
+        }
+        await readBody(req, 32 * 1024).catch(() => ({}))
+        return await withVmLock(vmPath, async () => {
+          if (!fs.existsSync(vmPath)) {
+            return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
+          }
+          const prev = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          prev.id = prev.id || id
+          const slotDir = path.join(cfg.paths.project, 'vms', id)
+          const removed = []
+          for (const file of [
+            path.join(slotDir, 'codex-credentials.json'),
+            path.join(slotDir, 'cli-home', '.codex', 'auth.json'),
+            path.join(slotDir, 'cli-home', '.claude', 'credentials.json'),
+            path.join(slotDir, 'cli-home', '.claude', '.credentials.json'),
+          ]) {
+            try {
+              if (fs.existsSync(file)) {
+                fs.rmSync(file, { force: true })
+                removed.push(path.relative(cfg.paths.project, file))
+              }
+            } catch {}
+          }
+          const vm =
+            patchVmRecord(cfg.paths.project, id, (record) => {
+              record.email = null
+              record.account_uuid = null
+              record.org_uuid = null
+              record.expires_at = null
+              record.codex = {}
+              record.claude = {}
+              record.worker_credential = null
+              record.refresh_status = null
+              record.refresh_error = null
+              record.restriction_reason = null
+              record.restriction_until = null
+              record.schedulable = false
+              record.schedule_disabled_reason = 'no_credential'
+              return record
+            }) || prev
+          try {
+            invalidateLiveCredentialCache()
+          } catch {}
+          // The kernel still holds the old token in memory: stop it, then bring a
+          // credential-less kernel back so the slot matches an empty slot.
+          const kernel = { stopped: false, restarted: false, error: null }
+          try {
+            kernel.stopped = !!stopCodexKernel(id)
+            if (isCodexVm(vm)) {
+              const started = await ensureCodexKernel(slotExec(cfg.paths.project, getVm(cfg.paths.project, id) || vm), {
+                timeoutMs: 8000,
+              })
+              kernel.restarted = !!started?.ok
+              if (!started?.ok) kernel.error = started?.reason || 'codex_kernel_start_failed'
+            }
+          } catch (e) {
+            kernel.error = String(e?.message || e).slice(0, 160)
+          }
+          try {
+            const repo = ctx.accountQuota?.repo
+            const row = repo && typeof repo.get === 'function' ? repo.get(id) : null
+            if (row && typeof repo.save === 'function') repo.save({ ...row, email: null, name: id })
+          } catch {}
+          const saved = getVm(cfg.paths.project, id) || vm
+          return json(
+            res,
+            200,
+            panel.ok({
+              cleared: { vm_id: id, files: removed, kernel },
+              vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig),
+            }),
+          )
+        })
+      }
       // POST /api/panel/vms/:id/reset-fingerprint
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/reset-fingerprint$/.test(p)) {
         const id = p.split('/')[4]
@@ -3194,7 +3473,18 @@ export function createPanelHandler(ctx) {
           }
         }
         // An explicit exit (e.g. local egress for a node: that VPS's own route) replaces auto-allocation.
-        const pickedProxyId = typeof body.proxy_id === 'string' ? body.proxy_id.trim() : ''
+        let pickedProxyId = typeof body.proxy_id === 'string' ? body.proxy_id.trim() : ''
+        if (pickedProxyId && isLocalEgressId(pickedProxyId)) {
+          // Local egress is per VPS: a generic pick resolves to the target machine's own row.
+          const resolved = proxyPool.resolveLocalTarget(pickedProxyId, nodeId || null)
+          if (!resolved.ok) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: resolved.error, message: LOCAL_PROXY_MISMATCH_MESSAGE },
+            })
+          }
+          pickedProxyId = resolved.id
+        }
         if (pickedProxyId) {
           const row = proxyPool.snapshot().proxies.find((proxy) => proxy.id === pickedProxyId)
           const owner = ident.role === 'user' ? normalizeOwnerId(req.panelUserId) : null
@@ -4168,35 +4458,67 @@ export function createPanelHandler(ctx) {
           }),
         )
       }
-      // POST /api/panel/model-policy/sync-worker
+      // POST /api/panel/model-policy/sync-worker — live Anthropic /v1/models through a Claude OAuth slot
       if (req.method === 'POST' && p === '/api/panel/model-policy/sync-worker') {
-        let workerIds = []
-        try {
-          workerIds = getCatalogIds()
-        } catch {}
-        if (!workerIds.length) {
-          try {
-            const raw = JSON.parse(fs.readFileSync('/opt/kin-gateway/data/cli-models.json', 'utf8'))
-            if (Array.isArray(raw?.ids)) workerIds = raw.ids
-          } catch {}
+        const status = await syncClaudeCatalog({ projectRoot: cfg.paths.project })
+        if (status.status !== 'ok') {
+          return json(res, status.status === 'skipped' ? 400 : 502, {
+            ok: false,
+            error: { code: status.error, message: status.error },
+            data: { synced: 0, catalog_sync: readCatalogSync() },
+          })
         }
-        const saved = syncWorkerModelsIntoPolicy(workerIds)
-        seedModelCatalog()
         return json(
           res,
           200,
           panel.ok({
-            policy: saved,
+            policy: getModelPolicy(),
             models: listPolicyModels(),
             effective: listOfficialModels(),
-            synced: workerIds.length,
+            synced: status.added.length,
+            added: status.added,
+            catalog_sync: readCatalogSync(),
           }),
         )
+      }
+      // GET /api/panel/pricing — effective price catalog for the 计费 tab
+      if (req.method === 'GET' && p === '/api/panel/pricing') {
+        return json(res, 200, panel.ok(buildPricing({ requestLog })))
+      }
+      // PUT /api/panel/pricing/overrides { key, price|null }
+      if (req.method === 'PUT' && p === '/api/panel/pricing/overrides') {
+        const body = await readBody(req, 256 * 1024)
+        const saved = setPriceOverride(String(body?.key || ''), body?.price ?? null)
+        if (!saved.ok) {
+          return json(res, 400, { ok: false, error: { code: 'invalid_price', message: saved.error } })
+        }
+        return json(res, 200, panel.ok({ ok: true, overrides: listPriceOverrides() }))
+      }
+      // POST /api/panel/pricing/sync — pull models.dev now
+      if (req.method === 'POST' && p === '/api/panel/pricing/sync') {
+        return json(res, 200, panel.ok({ models_dev: await syncModelsDev() }))
+      }
+      // POST /api/panel/pricing/reprice { since, until } — rewrite official cost only
+      if (req.method === 'POST' && p === '/api/panel/pricing/reprice') {
+        const body = await readBody(req, 8192)
+        const since = Date.parse(body?.since || '')
+        const until = Date.parse(body?.until || '')
+        if (!Number.isFinite(since) || !Number.isFinite(until) || since >= until) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_range', message: 'since/until must be ISO times with since < until' },
+          })
+        }
+        const result = requestLog.repo.repriceRange({
+          since: new Date(since).toISOString(),
+          until: new Date(until).toISOString(),
+        })
+        return json(res, 200, panel.ok(result))
       }
       // POST /api/panel/model-policy/sync-codex — ChatGPT GPT catalog via a Codex OAuth slot
       if (req.method === 'POST' && p === '/api/panel/model-policy/sync-codex') {
         const body = await readBody(req, 8192).catch(() => ({}))
-        const result = await syncCodexCatalog({
+        const result = await syncGptCatalog({
           projectRoot: cfg.paths.project,
           vmId: body?.vm_id || body?.vmId || url.searchParams.get('vm_id') || '',
           rotate: true,
@@ -4237,6 +4559,8 @@ export function createPanelHandler(ctx) {
             vm_id: result.vm_id,
             catalog_version: result.catalog_version,
             ids: result.ids,
+            added: result.added || [],
+            catalog_sync: readCatalogSync(),
           }),
         )
       }
@@ -4544,6 +4868,8 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && p === '/api/panel/proxies/local') {
         const result = proxyPool.ensureLocal()
         if (result.created) ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(result.proxy.id))
+        // Enabling local egress on a cluster that already has nodes: each VPS gets its row now.
+        proxyPool.syncLocalNodes(clusterNodesOf(ctx).map((node) => node.id))
         return json(res, 200, panel.ok(result))
       }
       if (req.method === 'POST' && p === '/api/panel/proxies/import') {
@@ -4810,7 +5136,11 @@ export function createPanelHandler(ctx) {
         const result = proxyPool.bind(id, vmId)
         if (!result.ok) {
           const message =
-            result.error === 'proxy_bind_limit' ? `SOCKS5 最多绑定 ${result.max || 5} 台虚拟机` : result.error
+            result.error === 'proxy_bind_limit'
+              ? `SOCKS5 最多绑定 ${result.max || 5} 台虚拟机`
+              : result.error === 'local_proxy_node_mismatch'
+                ? LOCAL_PROXY_MISMATCH_MESSAGE
+                : result.error
           return json(res, 400, {
             ok: false,
             error: { type: 'invalid_request_error', code: result.error, message, details: result },
