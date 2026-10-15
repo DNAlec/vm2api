@@ -1020,8 +1020,11 @@ export function jevModelDocument(inbound, body = inbound) {
   const parts = []
   const push = (source, text) => {
     const norm = normalizeText(text)
-    if (!norm || seen.has(norm)) return
-    seen.add(norm)
+    // Deduplicate repeated copies from inbound/body, but keep each message/input
+    // position distinct so repeated user turns remain separate evidence.
+    const key = `${source}\u0000${norm}`
+    if (!norm || seen.has(key)) return
+    seen.add(key)
     parts.push(`[${source}]\n${norm}`)
   }
   for (const src of [inbound, body]) {

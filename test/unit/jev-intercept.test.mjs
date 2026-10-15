@@ -671,6 +671,24 @@ test('jev reads the client system, and the previous nsfw sentence upgrades', () 
 
   const duplicated = { messages: [{ role: 'user', content: '相同内容只应送审一次。' }] }
   assert.equal(jevModelDocument(duplicated, duplicated), '[user message 1]\n相同内容只应送审一次。')
+  const sameAcrossRoles = {
+    system: '同一文本在不同来源仍要保留来源。',
+    messages: [{ role: 'user', content: '同一文本在不同来源仍要保留来源。' }],
+  }
+  const provenance = jevModelDocument(sameAcrossRoles)
+  assert.match(provenance, /\[system\]\n同一文本在不同来源仍要保留来源。/)
+  assert.match(provenance, /\[user message 1\]\n同一文本在不同来源仍要保留来源。/)
+
+  const repeatedUserTurns = {
+    messages: [
+      { role: 'user', content: '相同文本出现在两个用户回合。' },
+      { role: 'user', content: '相同文本出现在两个用户回合。' },
+    ],
+  }
+  assert.equal(
+    jevModelDocument(repeatedUserTurns),
+    '[user message 1]\n相同文本出现在两个用户回合。\n[user message 2]\n相同文本出现在两个用户回合。',
+  )
   const legacy = '这段话是否可以提交给模型，并且不包含色情、露骨性描写、性服务请求或任何未成年人性内容？'
   const upgraded = normalizeJevConfig({
     questions: [{ id: 'nsfw', label: '色情', summary: 'old', instructions: legacy, enabled: true }],
