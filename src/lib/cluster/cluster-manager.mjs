@@ -10,6 +10,23 @@ import net from 'node:net'
 import path from 'node:path'
 import { DOCKER_SOCKET_PATH, dockerInfo, dockerPing, sshDocker } from './docker-remote.mjs'
 import { collectLocalStatus } from './local-status.mjs'
+import {
+  mergeNodeEdit,
+  nodeEditConflict,
+  nodePlacementVersion,
+  readNodeHost,
+  validateNodeEditPatch,
+  verifyNodeRuntimes,
+} from './node-edit.mjs'
+import { NODE_HOST_COMMAND, NODE_HOST_TIMEOUT_MS, parseNodeHost } from './node-host.mjs'
+import {
+  dialGate,
+  ensureNodeGate,
+  newGateToken,
+  parseDirectLinkInput,
+  pingGate,
+  removeNodeGate,
+} from './direct-link.mjs'
 import { shellQuote } from './remote-fs.mjs'
 import { SocketRelay } from './socket-relay.mjs'
 import { configuredIpv6Enabled } from '../vm/proxy-policy.mjs'
@@ -27,6 +44,8 @@ import {
 export const HEALTH_INTERVAL_MS = 30_000
 export const SHELL_TICKET_TTL_MS = 30_000
 export const LOCAL_STATUS_TTL_MS = 30_000
+// A failed gate dial sends that node's slot traffic over SSH until the next good health ping or this long.
+export const DIRECT_LINK_BACKOFF_MS = 30_000
 const INSTALL_LOG_MAX = 64 * 1024
 
 const HOSTNAME_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i
@@ -100,12 +119,17 @@ export class ClusterManager {
     logger = console,
     onNodesChanged = null,
     onLinkState = null,
+    assertNodeEditable = () => {},
+    gateBin = process.env.KIN_CLUSTER_GATE_BIN || path.join(process.cwd(), 'bin', 'kin-slot-gate'),
   }) {
+    this.gateBin = gateBin
+    this.directState = new Map()
     this.listen = listen
     // Node add / remove: per-node resources (each VPS's local egress row) follow the list.
     this.onNodesChanged = onNodesChanged
     // Link settled (ready after its health check, or failed): per-node consumers refresh.
     this.onLinkState = onLinkState
+    this.assertNodeEditable = assertNodeEditable
     this.containerName = containerName
     this._local = null
     this._localAt = 0
@@ -156,6 +180,7 @@ export class ClusterManager {
         Promise.resolve(this._checkHealth(node.id))
           .catch(() => {})
           .finally(() => this._linkState(node.id, state))
+        this._ensureGate(node.id).catch(() => {})
       } else {
         this.health.delete(node.id)
         this._linkState(node.id, state)
@@ -214,6 +239,8 @@ export class ClusterManager {
     } catch (err) {
       if (err.code === 'streamlocal_failed') latencyMs = performance.now() - t0
     }
+    const hostRead = execCollect(client, NODE_HOST_COMMAND, { timeoutMs: NODE_HOST_TIMEOUT_MS }).catch(() => null)
+    const directRead = this._probeDirect(id)
     let docker
     let containers = null
     try {
@@ -223,6 +250,9 @@ export class ClusterManager {
     } catch (err) {
       docker = { ok: false, error: err.message }
     }
+    await directRead
+    const hostOut = await hostRead
+    const host = hostOut?.code === 0 ? parseNodeHost(hostOut.stdout) : null
     if (link.client !== client) return
     if (docker.ok && !configuredIpv6Enabled()) {
       const exits = await syncIpv6ProxyEgress(null, null, { nodeId: id, vms: this.vmsOnNode(id) })
@@ -234,11 +264,12 @@ export class ClusterManager {
       latency_ms: latencyMs == null ? null : Math.round(latencyMs),
       docker,
       containers,
+      host,
       checked_at: new Date().toISOString(),
     })
   }
 
-  _view(node) {
+  _view(node, directLinks = this.repo.directLinks()) {
     const link = this.links.get(node.id)
     return {
       ...node,
@@ -246,17 +277,134 @@ export class ClusterManager {
       health: this.health.get(node.id) || null,
       bridge: this.bridges.get(node.id)?.snapshot() || null,
       install: this.installs.get(node.id) || null,
+      direct_link: this._directView(node.id, directLinks.get(node.id)),
     }
   }
 
   list() {
-    return this.repo.list().map((node) => this._view(node))
+    const directLinks = this.repo.directLinks()
+    return this.repo.list().map((node) => this._view(node, directLinks))
   }
 
   get(id) {
     const node = this.repo.get(id)
     if (!node) throw new ClusterError(404, 'node_not_found', '节点不存在')
     return this._view(node)
+  }
+
+  _directView(id, cfg) {
+    if (!cfg) return null
+    const st = this.directState.get(id) || {}
+    const fallback = (st.downUntil || 0) > Date.now()
+    return {
+      address: cfg.address,
+      port: cfg.port,
+      state: st.checked_at ? (fallback || st.error ? 'down' : 'ok') : 'pending',
+      latency_ms: st.latency_ms ?? null,
+      error: st.error || null,
+      gate_error: st.gate_error || null,
+      checked_at: st.checked_at || null,
+    }
+  }
+
+  _directPatch(id, patch) {
+    this.directState.set(id, { ...(this.directState.get(id) || {}), ...patch })
+  }
+
+  /** Ping the gate; a good answer lifts the SSH fallback early, a bad one starts it. */
+  async _probeDirect(id) {
+    const cfg = this.repo.getDirectLink(id)
+    if (!cfg?.certSha256) return
+    const checked_at = new Date().toISOString()
+    try {
+      const ms = await pingGate(cfg)
+      this._directPatch(id, { latency_ms: Math.round(ms), error: null, downUntil: 0, checked_at })
+    } catch (err) {
+      this._directPatch(id, {
+        latency_ms: null,
+        error: err.code || 'gate_unreachable',
+        downUntil: Date.now() + DIRECT_LINK_BACKOFF_MS,
+        checked_at,
+      })
+    }
+  }
+
+  /**
+   * One slot connection over the direct link (`{ sock, ready }`), or null for
+   * the SSH path: no link, no pinned certificate yet, in backoff, or the dial
+   * failed before anything was sent. A refusal after that (bad token) starts
+   * the backoff too; a missing slot socket does not, it is not a link fault.
+   */
+  async _dialDirect(nodeId, vmId, kind) {
+    const cfg = this.repo.getDirectLink(nodeId)
+    if (!cfg?.certSha256) return null
+    if ((this.directState.get(nodeId)?.downUntil || 0) > Date.now()) return null
+    const down = (err) => {
+      this._directPatch(nodeId, { error: err.code, downUntil: Date.now() + DIRECT_LINK_BACKOFF_MS })
+      this.logger.warn(`[cluster] direct link ${nodeId} unavailable (${err.code}), using ssh`)
+    }
+    try {
+      const conn = await dialGate({ ...cfg, vmId, kind })
+      conn.ready.catch((err) => {
+        if (err.code !== 'gate_no_socket') down(err)
+      })
+      return conn
+    } catch (err) {
+      down(err)
+      return null
+    }
+  }
+
+  async _ensureGate(id, { strict = false } = {}) {
+    const cfg = this.repo.getDirectLink(id)
+    const link = this.links.get(id)
+    if (!cfg || link?.state !== 'ready' || !link.client) return
+    const client = link.client
+    try {
+      const host = await this.remoteHost(id)
+      const result = await ensureNodeGate({ client, host, docker: sshDocker(client) }, cfg, this.gateBin)
+      if (result.certSha256 !== cfg.certSha256) {
+        this.repo.setDirectLinkCert(id, result.certSha256)
+        this.logger.log(`[cluster] slot gate on ${id}: pinned certificate ${result.certSha256.slice(0, 16)}…`)
+      }
+      this._directPatch(id, { gate_error: null })
+      if (result.changed) this.logger.log(`[cluster] slot gate on ${id} (re)created from ${result.image}`)
+    } catch (err) {
+      this._directPatch(id, { gate_error: err.message })
+      this.logger.warn(`[cluster] slot gate on ${id}: ${err.message}`)
+      if (strict) throw err
+    }
+  }
+
+  /** Enable or move the direct link. Token and certificate pin are kept across edits and never returned. */
+  async setDirectLink(id, body) {
+    if (!this.repo.get(id)) throw new ClusterError(404, 'node_not_found', '节点不存在')
+    const { address, port } = parseDirectLinkInput(body)
+    const token = this.repo.getDirectLink(id)?.token || newGateToken()
+    this.repo.setDirectLink(id, { address, port, token })
+    this.directState.delete(id)
+    await this._ensureGate(id).catch(() => {})
+    // The gate needs a moment to bind after a (re)create.
+    for (let i = 0; i < 5; i += 1) {
+      await this._probeDirect(id)
+      if (!this.directState.get(id)?.error) break
+      await new Promise((resolve) => setTimeout(resolve, 400))
+    }
+    return this.get(id)
+  }
+
+  async clearDirectLink(id) {
+    if (!this.repo.get(id)) throw new ClusterError(404, 'node_not_found', '节点不存在')
+    this.repo.clearDirectLink(id)
+    this.directState.delete(id)
+    const link = this.links.get(id)
+    if (link?.state === 'ready' && link.client) {
+      const client = link.client
+      await removeNodeGate({ client, host: await this.remoteHost(id), docker: sshDocker(client) }).catch((err) =>
+        this.logger.warn(`[cluster] remove slot gate on ${id}: ${err.message}`),
+      )
+    }
+    return this.get(id)
   }
 
   /** Connect once with the form's credentials, report host key + docker reachability, disconnect. */
@@ -311,6 +459,172 @@ export class ClusterManager {
     return this._view(node)
   }
 
+  _prepareEdit(id, input) {
+    const node = this.repo.get(id)
+    if (!node) throw new ClusterError(404, 'node_not_found', '节点不存在')
+    validateNodeEditPatch(node, input)
+    const labelOnly = Object.keys(input).every((key) => key === 'label' || key === 'expected_updated_at')
+    if (labelOnly) {
+      const label = Object.hasOwn(input, 'label') ? input.label.trim() || node.host : node.label
+      if (label.length > 64) throw new ClusterError(400, 'invalid_label', '备注过长')
+      return { id, node, spec: { label }, connectionEdit: false, labelOnly: true, vms: this.vmsOnNode(id) }
+    }
+    const next = mergeNodeEdit(node, this.repo.getSecrets(id), input)
+    const spec = parseNodeInput(next, { requireHostKey: true })
+    const link = this.links.get(id)
+    const vms = this.vmsOnNode(id)
+    const edit = {
+      id,
+      node,
+      spec,
+      // Explicit connection edits must authenticate, even if normalization yields the saved values.
+      connectionEdit: true,
+      link,
+      generation: link?.generation,
+      client: link?.client,
+      vms,
+      placementVersion: nodePlacementVersion(vms),
+    }
+    this._assertEditCurrent(edit)
+    return edit
+  }
+
+  _assertEditCurrent(edit) {
+    const current = this.repo.get(edit.id)
+    if (!current) throw new ClusterError(404, 'node_not_found', '节点不存在')
+    if (current.updated_at !== edit.node.updated_at) throw nodeEditConflict()
+    if (!edit.connectionEdit) return
+    if (
+      !edit.link ||
+      this.links.get(edit.id) !== edit.link ||
+      edit.link.generation !== edit.generation ||
+      edit.link.client !== edit.client
+    )
+      throw nodeEditConflict()
+    if (nodePlacementVersion(this.vmsOnNode(edit.id)) !== edit.placementVersion) throw nodeEditConflict()
+    if (edit.vms.length && edit.spec.username !== edit.node.username) {
+      throw new ClusterError(409, 'node_username_in_use', '节点上仍有虚拟机，不能更换 SSH 用户；请先迁移或删除虚拟机')
+    }
+    if (this.repo.dependentsOf(edit.id).length) {
+      throw new ClusterError(409, 'node_in_use', '仍有节点经由它跳转，暂不支持修改该节点的连接配置')
+    }
+    const duplicate = this.repo.findByEndpoint(edit.spec.host, edit.spec.port, edit.spec.username)
+    if (duplicate && duplicate !== edit.id) throw new ClusterError(409, 'node_exists', '该主机与用户已接入')
+    if (this.installs.get(edit.id)?.status === 'running')
+      throw new ClusterError(409, 'node_busy', '节点正在安装 Docker，请稍后重试')
+    this.assertNodeEditable(edit.id)
+  }
+
+  async _probeEdit(edit) {
+    let previousHost = null
+    if (edit.vms.length && edit.client && edit.link.state === 'ready') previousHost = await this.remoteHost(edit.id)
+    this._assertEditCurrent(edit)
+    const sock = await this._jumpSock(edit.spec.jump_node_id, edit.spec.host, edit.spec.port)
+    const result = await connectSsh({
+      host: edit.spec.host,
+      port: edit.spec.port,
+      username: edit.spec.username,
+      authType: edit.spec.auth_type,
+      password: edit.spec.password,
+      privateKey: edit.spec.private_key,
+      passphrase: edit.spec.passphrase,
+      expectedSha256: edit.node.host_key_sha256,
+      sock,
+    })
+    let closed = false
+    const lost = () => {
+      closed = true
+    }
+    result.client.once('close', lost)
+    result.client.once('error', lost)
+    const candidate = {
+      ...result,
+      live: () => !closed,
+      cleanup: () => {
+        result.client.off('close', lost)
+        result.client.off('error', lost)
+      },
+    }
+    try {
+      let docker
+      try {
+        await dockerPing(sshDocker(result.client))
+        docker = { ok: true, error: null }
+      } catch {
+        docker = { ok: false, error: 'Docker socket 不可用，请检查 SSH 用户权限与 Docker 服务' }
+      }
+      let host = null
+      if (edit.vms.length) {
+        if (!docker.ok)
+          throw new ClusterError(409, 'node_runtime_mismatch', '新连接无法访问 Docker，不能确认现有虚拟机')
+        host = await readNodeHost(result.client)
+        await verifyNodeRuntimes(result.client, host, edit.vms, previousHost)
+      }
+      this._assertEditCurrent(edit)
+      if (!candidate.live()) throw nodeEditConflict()
+      return { ...candidate, host, docker }
+    } catch (err) {
+      candidate.cleanup()
+      result.client.end()
+      throw err
+    }
+  }
+
+  async probeUpdate(id, input) {
+    const edit = this._prepareEdit(id, input)
+    if (!edit.connectionEdit) {
+      return {
+        host_key: { alg: edit.node.host_key_alg, sha256: edit.node.host_key_sha256 },
+        docker: this.health.get(id)?.docker || { ok: false, error: '未探测' },
+        vm_count: edit.vms.length,
+        dependent_count: this.repo.dependentsOf(id).length,
+      }
+    }
+    const candidate = await this._probeEdit(edit)
+    try {
+      return { host_key: candidate.hostKey, docker: candidate.docker, vm_count: edit.vms.length, dependent_count: 0 }
+    } finally {
+      candidate.cleanup()
+      candidate.client.end()
+    }
+  }
+
+  async update(id, input) {
+    const edit = this._prepareEdit(id, input)
+    const candidate = edit.connectionEdit ? await this._probeEdit(edit) : null
+    let adopted = false
+    try {
+      this._assertEditCurrent(edit)
+      if (candidate && !candidate.live()) throw nodeEditConflict()
+      let saved
+      try {
+        saved = edit.labelOnly
+          ? this.repo.updateLabel(id, edit.spec.label, edit.node.updated_at)
+          : this.repo.update(id, edit.spec, edit.node.updated_at)
+      } catch (err) {
+        if (String(err.message).includes('UNIQUE constraint failed: cluster_nodes.')) {
+          throw new ClusterError(409, 'node_exists', '该主机与用户已接入')
+        }
+        throw err
+      }
+      if (!saved) throw nodeEditConflict()
+      if (candidate) {
+        // No await between the final version check, SQLite CAS and adoption. Existing relay closures retain this link.
+        candidate.cleanup()
+        edit.link.adopt(candidate, edit.generation)
+        adopted = true
+        if (candidate.host) this.hosts.set(candidate.client, Promise.resolve(candidate.host))
+        for (const [ticket, entry] of this.tickets) if (entry.nodeId === id) this.tickets.delete(ticket)
+      }
+      return this._view(saved)
+    } finally {
+      if (candidate && !adopted) {
+        candidate.cleanup()
+        candidate.client.end()
+      }
+    }
+  }
+
   _linkState(id, state) {
     try {
       this.onLinkState?.(id, state)
@@ -343,6 +657,7 @@ export class ClusterManager {
     this.bridges.delete(id)
     this.health.delete(id)
     this.installs.delete(id)
+    this.directState.delete(id)
     this.repo.remove(id)
     this._nodesChanged()
   }
@@ -377,21 +692,7 @@ export class ClusterManager {
     const client = this.client(id)
     const cached = this.hosts.get(client)
     if (cached) return cached
-    const script =
-      'id -u; id -g; printf "%s\\n" "$HOME"; if sudo -n true 2>/dev/null; then echo sudo; else echo nosudo; fi'
-    const pending = execCollect(client, `sh -c ${shellQuote(script)}`, { timeoutMs: 15_000 }).then((r) => {
-      const [uid, gid, home, sudo] = r.stdout.split('\n').map((s) => s.trim())
-      if (r.code !== 0 || !/^\d+$/.test(uid) || !/^\d+$/.test(gid) || !home.startsWith('/')) {
-        throw new ClusterError(502, 'remote_host_unknown', `读取节点用户信息失败：${(r.stderr || r.stdout).trim()}`)
-      }
-      return {
-        uid: Number(uid),
-        gid: Number(gid),
-        home,
-        root: `${home.replace(/\/+$/, '')}/.vm2api`,
-        sudo: sudo === 'sudo',
-      }
-    })
+    const pending = readNodeHost(client)
     pending.catch(() => this.hosts.delete(client))
     this.hosts.set(client, pending)
     return pending
@@ -421,8 +722,18 @@ export class ClusterManager {
     const entry = {
       nodeId,
       paths,
-      kernel: new SocketRelay({ socketPath: paths.kernel, remotePath: remote('kernel.sock'), getClient }),
-      worker: new SocketRelay({ socketPath: paths.worker, remotePath: remote('worker.sock'), getClient }),
+      kernel: new SocketRelay({
+        socketPath: paths.kernel,
+        remotePath: remote('kernel.sock'),
+        getClient,
+        dialDirect: () => this._dialDirect(nodeId, vmId, 'kernel'),
+      }),
+      worker: new SocketRelay({
+        socketPath: paths.worker,
+        remotePath: remote('worker.sock'),
+        getClient,
+        dialDirect: () => this._dialDirect(nodeId, vmId, 'worker'),
+      }),
     }
     entry.ready = Promise.all([entry.kernel.start(), entry.worker.start()])
     this.slotRelays.set(vmId, entry)

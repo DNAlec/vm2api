@@ -23,6 +23,7 @@ import { slotExecArgv } from '../vm/slot-exec.mjs'
 import {
   CONTAINER_CLI_NODE_BIN,
   KERNEL_NATIVE_SLOT_COUNT,
+  normalizeSessionIdleTtlSeconds,
   resolveCliSystemLayout,
   resolveKernelDataplane,
   resolveSlotPersonaPreset,
@@ -35,6 +36,11 @@ import {
   replaceSlotOwnedFile,
 } from '../oauth/oauth-credentials.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+
+function normalizeAutoCompactWindow(value) {
+  const windowTokens = Number(value)
+  return Number.isInteger(windowTokens) && windowTokens >= 100_000 && windowTokens <= 1_000_000 ? windowTokens : null
+}
 
 const starts = new Map()
 const KVM_HEALTH_MS = { kvm: 120_000, tcg: 480_000 }
@@ -691,6 +697,18 @@ export function writeKernelConfig(
   const idleMs = routing == null && previousIdleSeconds > 0 ? previousIdleSeconds * 1000 : streamIdleTimeoutMs(routing)
   const previousMax = Number(previous.max_request_bytes)
   const requestBytes = routing == null && previousMax > 0 ? previousMax : maxRequestBytes(routing)
+  const cchEnabled = routing == null ? previous.cch_enabled !== false : routing?.compatibility?.cch_enabled !== false
+  const previousWindow = Number(previous.auto_compact_window)
+  const autoCompactWindow =
+    routing == null
+      ? Number.isInteger(previousWindow) && previousWindow >= 100_000 && previousWindow <= 1_000_000
+        ? previousWindow
+        : null
+      : normalizeAutoCompactWindow(routing?.compatibility?.auto_compact_window)
+  const sessionIdleTtlSeconds =
+    routing == null
+      ? normalizeSessionIdleTtlSeconds(previous.session_idle_ttl_seconds)
+      : normalizeSessionIdleTtlSeconds(routing?.inference?.session_idle_ttl_seconds)
 
   const kind = runtimeKind(record)
   const config = {
@@ -705,6 +723,7 @@ export function writeKernelConfig(
     request_timeout_seconds: 0,
     first_byte_timeout_seconds: 600,
     idle_timeout_seconds: Math.ceil(idleMs / 1000),
+    session_idle_ttl_seconds: sessionIdleTtlSeconds,
     max_request_bytes: requestBytes,
     max_response_bytes: 64 * 1024 * 1024,
     max_event_bytes: 32 * 1024 * 1024,
@@ -718,6 +737,8 @@ export function writeKernelConfig(
     system_layout: resolveCliSystemLayout(vm, routing || {}),
     cli_version: OFFICIAL_CLI_VERSION,
     default_cache_ttl: defaultCacheTtl,
+    cch_enabled: cchEnabled,
+    auto_compact_window: autoCompactWindow,
   }
 
   if (tz) config.timezone = tz
