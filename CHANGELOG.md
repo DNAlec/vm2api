@@ -1,5 +1,89 @@
 # Changelog
 
+## 1.4.015 — 2026-10-27
+
+- #775：风险审计的硬正则和决策模型只读用户正文。`system`、`instructions`、消息里的 `role=system`、`# Environment` 和已闭合的 `<system-reminder>` 不再送审；未闭合的提醒标签不再把后面的用户句子一起删掉。多轮请求把最后一条用户正文再标成 `[current ask]`，避免 16000 字尾窗只剩历史。拒答缓存的指纹不变，仍含工具回传。决策模型拦住时，`usage_logs.jev_state`（迁移 044）记下当时 POST 的 `state`，请求详情显示为送审正文；这是送审上下文，不是模型指出的命中句。`intercept.keyword` 仍只是题库类别。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。启动应用迁移 044。不必 `fetch:payload` / `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。旧日志没有 `jev_state`，补不回来。
+
+## 1.4.014 — 2026-10-27
+
+- #773：重复合法自定义工具名出站前唯一化（保留首个，后续 `kin_tool_<hash>`；`tool_choice`/历史指首个）；唯一性不再受 `tool_name_rewrite` 影响；相同服务端工具去重，冲突/非法本地 400 `invalid_tool_name`。
+
+已部署机升级：仅更新 Node 控制面后重启；cli-node 哈希未变，不必 `fetch:payload` / `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.013 — 2026-10-27
+
+- #769：API 内核 SSE 响应逐块 flush，修复小响应缓冲到结束才返回的问题，保留实际流式交付和首 Token 时序。
+- #769：协议 token 口径：Claude 转 Chat / Responses 的输入总数包含缓存；OpenAI 规范化区分 inclusive / disjoint 输入并识别显式缓存写入别名，reasoning 保留为 output 子集，不重复累加。
+- #769：日志真实性：TTFT 按 cli-node / OpenAI 实际生成内容或进度打点；新增 `first_byte_ms`、`generation_ms`（迁移 043），列表、请求概览和性能页统一按实测上游输出窗口计算 tok/s，包含隐藏推理、排除终结后的收尾。旧日志或单包缓冲窗口不可测时不再估算速率。
+- #769：日志实际用量：合并 SSE 与最终 usage 时保留缓存读写明细，不重复扣缓存；Codex 明确报告的缓存写入赋值到日志列，未报告为未知（`null`），不从未命中输入推算；详情总 token 使用输入、输出、缓存读写的完整总量。
+
+#769 已部署机升级：须更新 Node、`web/dist` 与源码构建的 `kin-api-kernel`，重启对应控制面/API 内核进程；启动自动应用迁移 043。无需替换 cli-node / Claude 或 Codex kernel payload，不需 `wrap-cli/sync` 或重建槽。历史错误速率无原始时序不能补算，历史缓存写入 0 也不臆测回填。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.012 — 2026-10-27
+
+- #764（Fixes #764）：新装/缺省出站 `cc_entrypoint` 改为 `cli`（原 `sdk-cli`）。`routing.json` 未写或省略该字段时，网关补 billing、出站 UA 与 kernel 投影均解析为 `cli`；仅显式保存 `sdk-cli` 时仍为 `sdk-cli`。**不**迁移已有部署里已写入的 `sdk-cli`。
+
+已部署机升级：须更新 Node 控制面 + `web/dist` 后重启。cli-node 附件哈希相对 1.4.011 **未变**，故 **不必** `fetch:payload` / `wrap-cli/sync`；完整 cli-node 热读新缺省仍依赖后续 payload 升级。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.011 — 2026-10-27
+
+- #736：修复 KVM 槽在关机或「恢复服务」时因换镜像重建容器却未回填 `KIN_KVM_MAC` / `KIN_KVM_DISK_SERIAL` 导致 kin-kvm 启动失败；停/启与恢复路径会从槽配置、旧容器 env 或已采集的 guest hardware 回填并写回 `vm.machine`，env 不完整的容器会强制重建。
+
+已部署机升级：仅需更新 Node 控制面后重启；不必 `fetch:payload` / `wrap-cli/sync`，不必重建槽，无 DB 迁移。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.010 — 2026-10-27
+
+- #759：默认身份句与 0注入 `prompt_version` 改为 `You are Claude Code, Anthropic's official CLI for Claude.`。页面摘要、预览和 cli-node 读取的 `{{identity}}` / `{{identity_cli}}` 都是这句；已保存的自定义模板不变。
+
+已部署机升级：须更新 Node 控制面 + `web/dist` 后重启。cli-node 哈希相对 1.4.009 **未变**（仍 f29bbfa45b68308367f4091699cbeb3a0baba860d327d349d6d55cc11408fb68），故 **不必** `fetch:payload` / `wrap-cli/sync`。无 DB 迁移、不必重建槽。已保存自定义 persona 不变，仅默认/重置路径吃新身份。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.009 — 2026-10-27
+
+- #757：升级/安装后槽刷新改经控制面（等节点 ready → `wrap-cli/sync` restart:true → fleet-update telemetry），修复远程槽 `cluster_unavailable` 且不同步 cli-node；同内容哈希镜像的远程运行中槽跳过重建；`syncInstalledKernels` 串行防并发。无 `deploy/payload.json` / cli-node 哈希变更。
+
+已部署机升级：须更新 Node 控制面镜像（含新 `fleet-services`）后重启。`panel-upgrade` / `install` 升级路径会经控制面执行 `wrap-cli/sync`（restart:true）再 telemetry。cli-node 哈希相对 1.4.008 **未变**（仍 f29bbfa45b68308367f4091699cbeb3a0baba860d327d349d6d55cc11408fb68），故 **不必** `fetch:payload`。无 DB 迁移。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.008 — 2026-10-27
+
+- #754：面板可配置每模型缺省 effort（off=不向上游补）；保存/重置模型策略后热写运行中 Claude 槽 kernel.json 的 model_effort；Node ensureUnofficialEffortHigh 对 off 不补 output_config.effort。Supersedes #748。
+
+已部署机升级：须更新 Node 控制面 + `web/dist` 后重启。`deploy/payload.json` 的 cli-node 哈希相对 1.4.007 **未变**（仍 f29bbfa45b68308367f4091699cbeb3a0baba860d327d349d6d55cc11408fb68 / payload-2026.10.26-cli-effort），故本版 **不必** `fetch:payload` / `wrap-cli/sync`。完整「cli-node 热读 model_effort」依赖更新的 ELF，本 tip 未换附件；仅 Node/面板路径的 off 不补与 kernel.json 投影已生效。无 DB 迁移、不必重建槽。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.007 — 2026-10-26
+
+- #752：`deploy/payload.json` 的 `cli-node` 对齐线上哈希（size 27789508，sha256 f29bbfa45b68308367f4091699cbeb3a0baba860d327d349d6d55cc11408fb68）——已部署机升级须 `npm run fetch:payload` + `wrap-cli/sync`（restart:true）后重启 Node；仅更 Node 不够。
+
+已部署机升级：须 `npm run fetch:payload` 拉取更新后的 payload 后执行 `wrap-cli/sync`（`restart:true`），再重启 Node 控制面；仅更新 Node 不够。不必重建槽，无 DB 迁移。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.006 — 2026-10-26
+
+- #749：`run/` 目录属主与目录内文件一致（Fixes #740）——`writeKernelConfig` 目录 chown 改用 `runtimeFileOwner`，避免命名槽 ID（如 account2example）目录/文件 uid 不一致导致 Permission denied。
+
+已部署机升级：仅需更新 Node 控制面后重启；不必 `fetch:payload`，不必 `wrap-cli/sync`，不必重建槽，无 DB 迁移。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.005 — 2026-10-26
+
+- #746：修复 ARM64 预构建镜像安装：`.env` 的 `COMPOSE_FILE` 若含源码用的 `docker-compose.arm64.yml` 会错误走本地镜像名；**新版** `deploy/install.sh` 在镜像模式下只去掉该项（保留其它 overlay，去掉后为空才设为 `docker-compose.yml`），且不为空的 `COMPOSE_FILE` 写入默认值以免屏蔽 `docker-compose.override.yml`。**仅跑新版 install.sh 时生效**；面板一键更新不改 `.env`，用旧脚本升级的那一次仍是旧逻辑。面板升级 Compose 运行前忽略宿主 `DOCKER_DEFAULT_PLATFORM`（与 install.sh 一致）。见 `docs/ARM64.md`。
+- #744（取代 #697，作者 VankaIn）：本机 SOCKS5 槽位不再随 Docker 守护进程抢先启动：使用 `restart=no`，由控制面的自动恢复流程先恢复代理规则再启动槽位；升级时原地迁移已有容器的重启策略。出口初始化先安装阻断规则，代理进程失败时保持断网。升级后须确认控制面启动成功，再重启 Docker；详见 `docs/DEPLOY.md`。
+
+已部署机升级：仅需更新 Node 控制面后重启；不必 `fetch:payload`，不必 `wrap-cli/sync`，不必重建槽，无 DB 迁移。#744 为高风险：须先确认控制面启动成功（`restart=no` 迁移失败会阻止启动）再重启 Docker；远端节点 iptables 顺序同步变化；ARM64 预构建镜像用户需再跑一次新版 `install.sh`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.04 — 2026-10-26
+
+- #743（Fixes #717 / #715）：GPT 额度刷新或面板「恢复状态」时，按窗口用量重算并清除过期的 `codex.extra.codex_limited_until`；手动恢复不再只清 Claude 冷却字段而留下 Codex 专用停用标记。
+- #716：出口代理把「域名转发」开关 `domain_forward` 透传到 kin-egress；已开该开关的代理需再点一次开关或触发出口修复/槽启动，旧 kin-egress 才会写出 domain_forward。
+- #713：删除槽位时清理其账号池成员（removeVm / reconcileVms prune），面板阻止同一槽位跨池勾选。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启一次 Node；不必 `fetch:payload`，不必 `wrap-cli/sync`，不必重建槽，无 DB 迁移。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.03 — 2026-10-26
+
+- #712：重载 GPT（Codex）槽位时，先停掉并等待控制面里实际在跑的 Codex 内核再重新拉起，使其应用当前代理；停不掉（`untracked_kernel` / `recycle_timeout`）时返回 `codex_kernel_reload_failed`，不再复用旧内核的健康状态。（作者 venn0126，Fixes #711）
+
+已部署机升级：仅更新 Node 控制面后重启一次 Node；不必 `fetch:payload`，不必 `wrap-cli/sync`，不必重建槽，无 DB 迁移。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.02 — 2026-10-26
 
 - 对话结束且没有排队的后续请求时，立即释放 `session_slots`。粘性 TTL 只记住用过的 VM、账号和出站 session，不占席位，到期时间不刷新。
@@ -36,7 +120,6 @@
 - 动态 profile 按出站入口分成两套。`cc_entrypoint=cli` 用交互身份句，并保留 guidance 里的 `! <command>` 提示。缺省 `sdk-cli` 用 Agent SDK 身份句，去掉这句，对齐 `--print` 抓包。billing、UA 和兜底头仍走原来的入口开关。
 
 - 设置 → 协议和 system提示词可切换出站入口 `sdk-cli` / `cli`。网关生成的 billing、出站 UA、cli-node 兜底 billing 使用同一个值。调用方自带的 billing 入口不改，CCH 密封只改 `cch`。保存后写入各 Claude 槽 `kernel.json` 的 `cc_entrypoint`，当前本机 cli-node 每次请求热读，不重启槽。缺省仍是 `sdk-cli`。plain ELF 已验证两个值同步切换，非法值回到 `sdk-cli`。
-
 
 - cli-node 对齐 2.1.303 计费行和 beta 选择器后重编。源码 `9a0f53da`，协议 `850b57aa`。plain ELF 五模型最终 beta 与 API key 路径的抓包顺序一致，haiku 的 `claude-code` 在第 6 位，auto 为 12 项。plain 117487744 字节 `56f068f0…`；UPX 5.0.2 `--best --lzma` 后 27794232 字节，SHA256 `d9f0ba21f2b12f2b00117e0f2fc8862ac8569477f5a4f5797324d9336c523e0b`。`upx -t` 与压缩后 cli-hop e2e 7/7 通过，`--version` 为 `2.1.303 (Claude Code)`。已替换本机 `share/wrap-cli/cli-node`。payload 未更新，未部署。
 - 官方档和完整档的 system 对齐 2.1.303：billing、身份、harness（`1h` + `scope global`）、guidance（`1h`）。拆分边界只交给 cli-node，最终请求不出站。调用方 system 和第三方 harness 接在 guidance 后，不替换官方提示。
@@ -241,7 +324,6 @@
 - 集群槽 prepareRemoteDir：程序目录 slot-bin 改为 0755（私有 run/claude/cli-home 仍 0700），使 CapDrop ALL 的 egress 能 traverse /opt/kin-live，避免迁 live 后容器停在 Created / permission denied。（#632）
 
 已部署机升级：更新 Node 控制面后重启一次。cli-node 字节已变，需要 `wrap-cli/sync`（逐槽重启 dataplane，不要 `docker rm`）。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
-
 
 ## 1.3.201 — 2026-10-20
 
