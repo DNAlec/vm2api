@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- #779：官方 / 完整官方提示词已组装动态边界后，恢复对话历史的消息缓存断点：没有调用方消息断点时，按剩余四断点预算补最后及上一条 user（预算只剩一个时优先最后一条）。保留 system 文本和调用方消息断点；沿用官方档工具断点清理行为，在清理后计算消息断点预算。lean / preserveSystem / requestContext 路径不启用消息补点。
+- #779：默认缓存写入 TTL 同时用于网关生成的官方模板断点和新增消息断点。模板标记未声明 TTL 时在生成阶段补齐，使用请求覆盖及会话固定后的值；已有明确 TTL 和调用方消息标记保持不变，并约束新增 TTL 避免 5m 后出现 1h。不会仅凭调用方 system 的动态边界标记认定其为网关生成的模板。
+
+已部署机升级：仅更新 Node 控制面后重启；cli-node 哈希未变，不必 `fetch:payload` / `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.016 — 2026-10-27
 
 - #778：zero 档已带 billing `prompt_version`、调用方未提供 cache 标记时，恢复消息 `cache_control` 断点兜底（单轮 1 个、多轮最多 2 个，复用 `officialMessageMarker` 与解析后 TTL；不追加 system 模板；已有 system/tools/消息断点则保留不补点；lean/shaped/preserveSystem/requestContext 路径不启用）。
