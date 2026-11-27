@@ -10,8 +10,13 @@ export function createUsageLink(req, res, requestId) {
   return {
     complete(turn, stream) {
       const parent = turn?.tool_continuation_parent_request_id
-      if (!turn?.local_tool_drain || typeof parent !== 'string' ||
-          !/^[A-Za-z0-9_.:-]{1,128}$/.test(parent) || parent === requestId) return ''
+      if (
+        !turn?.local_tool_drain ||
+        typeof parent !== 'string' ||
+        !/^[A-Za-z0-9_.:-]{1,128}$/.test(parent) ||
+        parent === requestId
+      )
+        return ''
       if (stream) {
         return `: vm2api-usage-link ${JSON.stringify({ request_id: requestId, parent_request_id: parent, kind: 'local_tool_drain' })}\n\n`
       }
