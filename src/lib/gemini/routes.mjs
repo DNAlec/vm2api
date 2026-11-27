@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { createUsageLink } from './usage-link.mjs'
 import http from 'node:http'
 import { isIP } from 'node:net'
 import path from 'node:path'
@@ -2361,6 +2362,7 @@ export function createGeminiPublicHandler({
         ? requestLog.start(req, { protocol: logProtocolName(protocol), pathName: url.pathname })
         : null
     const activeLogCtx = externalLogCtx || ownLogCtx
+    const usageLink = createUsageLink(req, res, activeLogCtx?.request_id)
     const startedAt = activeLogCtx?.t0 || Date.now()
     const logBag = externalLogBag || {}
     if (logBag.outbound_headers_source === 'unavailable') logBag.outbound_headers_source = null
@@ -3050,12 +3052,14 @@ export function createGeminiPublicHandler({
       }
       applyTurnLog(turn)
       if (wantStream) {
+        writeChunk(usageLink.complete(turn, true))
         writeChunk(encoder.finish())
         if (!headersSent) beginSse(res)
         res.end()
         if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
         return
       }
+      usageLink.complete(turn, false)
       return respondJson(
         200,
         renderGeminiProtocolResponse(protocol, turn, {
