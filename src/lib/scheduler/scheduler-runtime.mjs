@@ -47,6 +47,7 @@ import {
 } from '../db/repos/scheduler-pools-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { resolveUpstreamModel, stripAntigravityPrefix } from '../gemini/model-catalog.mjs'
+import { isGeminiSeriesId, resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
 import { OFFICIAL_303_PRESET, normalizePersonaPreset } from '../identity/persona-template.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import { endpointMatchesModel, stripPrefix } from '../pool/api-scheduler.mjs'
@@ -536,7 +537,10 @@ function geminiEnvServesModelLocal(env, model, { allowUnprefixedGemini3p = false
     .trim()
     .replace(/^models\//i, '')
   if (!cleaned) return true
-  if (resolveUpstreamModel(cleaned, rawModels, { allowUnprefixedNonGemini: allowUnprefixedGemini3p })) {
+  if (resolveUpstreamModel(cleaned, rawModels, {
+    allowUnprefixedNonGemini: allowUnprefixedGemini3p,
+    defaultEffort: isGeminiSeriesId(cleaned) ? resolveGeminiDefaultEffort(cleaned) : null,
+  })) {
     return true
   }
   const wantLower = cleaned.toLowerCase()
