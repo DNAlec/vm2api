@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.246-nekocloud.2 — Gemini M3 基础别名准入回归修复
+
+- 恢复准入层的既有默认 effort 解析，修复仅有分档目录时基础 Gemini 模型名被误拒为 429。
+- 不修改客户模型映射、默认档位或 Key/租户权限；增加真实 Rust 调度回归及权限负例。
+- 无新增迁移，CRAGGemini 仍为 0.5.4；继承 nekocloud.1 的已知上游商店测试失败边界。
+
+
 ## 1.4.246-nekocloud.1 — 2026-11-28 · 合并官方 v1.4.246 并保留 fork 补充修复
 
 - 完整合并官方 v1.4.240–v1.4.246，采用上游 Gemini Schema 正则兼容、xhigh 思考档位、局部 bridge_disconnected 502 隔离及 CRAG handoff_complete 热修。
