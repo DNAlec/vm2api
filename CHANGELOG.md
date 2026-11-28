@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.4.258-nekocloud.1 — 2026-11-28 · 合并上游 v1.4.258
+
+- 合并上游 v1.4.256–v1.4.258，采用 502 临时停调度标记十分钟过期、Gemini 独立熔断配置、多租户代理与目录过滤、上游错误语义及 V4 headless 容量修复。
+- 保留 fork 的 Gemini 分组额度准入、排队后额度复核、租约有效性检查、工具续接关联和本地工具校验的请求级归因；真实上游 502 按上游的新过期规则恢复。
+- 本轮无新增数据库迁移或载荷钉选变更；Gemini 空闲超时保持原值。升级要求仍包含此前版本的数据库迁移与 Node/Rust 配套更新。
+- 合并验证：27 个相关后端测试文件共 580 项通过，无跳过；本轮 Rust 与前端源码未变化。
+- Review 已知遗留问题：旧 CRAG 槽不支持空系统提示词替换时，本地 crag_prompt_replace_empty_unsupported 仍以 transport 上报 Rust，导致节点约 30 秒冷却；已隔离复现，本次保留上游实现，尚未修复。该路径与 Gemini 本地工具校验豁免独立。
+
+## 1.4.258 — 2026-11-28 · 控制面 Gemini 熔断改按 `gemini.pool.circuit_*` 生效
+
+- **控制面 `gemini:<环境 id>` 单元熔断跟随 `gemini.pool.circuit_*`（#2084，外部贡献）**：此前 `gemini.pool.circuit_failure_threshold` / `circuit_open_ms` 只通过 `apply-policy` 下发给 CRAGGemini 内核，控制面这一层的 Gemini 环境熔断实际借用的是 Claude 的 `pool.circuit_*`——在面板里改 Gemini 的熔断阈值（包括设为 `0` 关闭）对控制面不生效，环境详情里显示的 threshold / open_ms 也是 Claude 的值。
+  - `src/lib/pool/unit-circuit.mjs`：新增按 id 前缀的作用域 `configureScope` / `clearScope` / `settingsFor`，`inspect` / `admit` / `recordFailure` / `view` 按单元所在作用域取阈值与冷却时长，取最长匹配前缀，无匹配时用全局值；作用域阈值为 `0` 时该作用域不熔断（不计失败、始终放行、面板显示 closed）
+  - `src/lib/admin/routing-runtime.mjs`：`configureUnitCircuit` 在配置全局值后，用 `normalizeGeminiRouting(routing.gemini).pool` 配置 `gemini:` 作用域；保存路由时 `body.pool` 或 `body.gemini` 任一存在即重新配置（此前只看 `body.pool`）
+  - Claude 单元仍按 `pool.circuit_*`，不受影响；两边保持默认 `3 / 30000` 时行为不变
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零前端改动；升级后重启控制面即可生效，若运营曾在面板把 Gemini 熔断阈值设为 `0`，升级后控制面这一层才会真正关闭 Gemini 熔断。
+
+## 1.4.257 — 2026-11-28 · Gemini 多租户代理出口隔离、上游错误语义保留与 V4 headless 容量对齐
+
+- **Gemini 多租户代理出口隔离与目录过滤（#2079）**：
+  - `src/lib/gemini/routes.mjs`：`proxyEgressOptionsFor` 在取认证信息前先做租户归属校验——租户环境只能用平台共享代理或自己的代理，平台环境只能用无归属代理，别的租户的代理一律返回 `null`；`warmGeminiEnvironments` 与 `createGeminiTerminal` 按环境归属解析代理与 `egress_options`，租户环境的预热与终端不再丢失出口选项
+  - `src/lib/admin/catalog-monitor.mjs`、`src/lib/admin/panel-routes.mjs`、`src/server.mjs`：`syncGeminiCatalog` / `createCatalogMonitor` 经 `resolveGeminiProxyEgressOptions` 把 `egress_options` 带到模型目录拉取
+  - `src/lib/gemini/scheduler.mjs`：对外部传入的 `catalogSnapshot` 增加 `ownerScope` 与 `allowedEnvIds` 过滤，托管号池路径行为不变
+- **上游错误语义保留（#2079）**：`mapUpstreamError` 新增 `crag_prompt_too_large`（400）、`pool_forbidden`（403 `permission_error`）、`crag_prompt_replace_empty_unsupported`（503 `overloaded_error`，不可重试）并补入 `STRICT_LOCAL_GATEWAY_CODES`；旧槽位抛出 `crag_prompt_replace_empty_unsupported` 时保留 503 语义，混合池内直接切换到支持的节点，耗尽时向客户端保留 503（`src/lib/core/errors.mjs`、`src/lib/pool/{upstream-error-policy,failover-runner}.mjs`）
+- **V4 headless bridge 容量对齐（#2079）**：槽位持久化并透出 `capabilities` / `kernel_generation` / `transport`（`kernel-install.mjs`、`vm-registry.mjs`、`kernel-catalog.mjs`），`isHeadlessBridgeSlot` 识别 `kernel_installation.transport === 'headless_bridge'` 与 `kernel_generation >= 4`；容量对账器、看门狗、`seatCapOf` / `seatCapForVm` 与 `/api/panel/pools` 统一按同一份能力计算有效槽位数，避免面板座位数与内核实际容量不一致
+- 部署说明：本次改动零数据库迁移、零 Rust 变更；升级后重启控制面即可生效，V4 内核槽位的座位上限会按其声明的能力重新计算。
+
+## 1.4.256 — 2026-11-28 · Gemini 单次上游 502 不再把健康账号永久摘出调度
+
+- **瞬时 `upstream_502` / `proxy_502` 的 unschedulable 标记 10 分钟后自动过期（#2077，Fixes #2049）**：此前一次上游 502 会把 `settings.gemini_slot_prefs[envId].unschedulable` 持久化，而全仓没有任何自动清除路径（周期检查的自动恢复只覆盖 `reauth_required` / `verification_required` / `location_unsupported` / `ineligible`），健康账号因此被永久摘出调度，所有 Gemini 请求返回 `429 gemini_pool_overloaded`，只能手动 `recover`。
+  - `src/lib/gemini/slot-prefs.mjs`：`get()` / `resolved()` / `all()` 读取时判定，瞬时原因的标记距其 `at` 满 10 分钟即过期，并从存储中删除；新的 502 会重新计时；升级前已落盘的旧 502 标记按其既有 `at` 过期，无需迁移
+  - 确定性状态（`reauth_required`、`verification_required`、`location_unsupported`、`ineligible`）与运营手动 `schedulable:false` 不受影响；`gemini.failover.unschedulable_on_502=false` 仍可整体关闭该标记行为
+  - 10 分钟为固定默认值，未做成配置项；issue 中「面板取消进行中的授权」一项未处理（独立接口，另行跟进）
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零前端改动；升级后重启控制面即可生效，已被 502 标记的账号会在各自 `at` 满 10 分钟后自动恢复。
+
 ## 1.4.255-nekocloud.1 — 2026-11-28 · 合并上游 v1.4.255 与 Gemini 本地工具错误归因修复
 
 - 合并上游 v1.4.247–v1.4.255，采用上游 M3 调度规则恢复、节点冷却可视化、CRAG 3.1.30 工具兼容与 Codex 传输修复。

@@ -898,7 +898,12 @@ function proxyRecordFor(proxyPool, proxyId, ownerUserId = null) {
 
 function proxyEgressOptionsFor(proxyPool, proxyId, { ownerUserId = null } = {}) {
   if (!proxyPool || !validId(proxyId)) return null
-  const proxy = proxyRecordFor(proxyPool, proxyId, ownerUserId)
+  const targetOwner = normalizeOwnerId(ownerUserId)
+  const proxy = proxyRecordFor(proxyPool, proxyId, targetOwner)
+  if (!proxy) return null
+  const pOwner = normalizeOwnerId(proxy.owner_user_id)
+  const ownerAllowed = targetOwner ? !pOwner || pOwner === targetOwner : !pOwner
+  if (!ownerAllowed) return null
   const withAuth = proxyPool.getProxyByIdWithAuth?.(proxyId) || null
   const opts = {}
   if (proxy?.domain_forward === true || withAuth?.domain_forward === true) {
@@ -1015,7 +1020,12 @@ export const callGeminiHostStream = (operation, payload, options) =>
  * for all authorized, licensed OAuth environments so inference starts hot and recovers
  * automatically after control-plane or gemini-host restarts.
  */
-export async function warmGeminiEnvironments({ callHost = callGeminiHost, proxyPool, environmentIds = null } = {}) {
+export async function warmGeminiEnvironments({
+  callHost = callGeminiHost,
+  proxyPool,
+  geminiOwnersRepo = null,
+  environmentIds = null,
+} = {}) {
   const report = { warmed: 0, warming: 0, skipped: 0 }
   let view
   try {
@@ -1051,15 +1061,16 @@ export async function warmGeminiEnvironments({ callHost = callGeminiHost, proxyP
       report.warmed += 1
       continue
     }
+    const ownerUserId = geminiOwnersRepo?.getOwner ? normalizeOwnerId(geminiOwnersRepo.getOwner(env.id)) : null
     let proxyUrl
     try {
-      proxyUrl = proxyFor(pool, env.proxy_id)
+      proxyUrl = proxyFor(pool, env.proxy_id, { ownerUserId })
     } catch {
       report.skipped += 1
       continue
     }
     const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
-    const egressOptions = proxyEgressOptionsFor(pool, env.proxy_id)
+    const egressOptions = proxyEgressOptionsFor(pool, env.proxy_id, { ownerUserId })
     try {
       const res = await callHost('warm', {
         id: env.id,
@@ -1228,7 +1239,7 @@ export async function checkGeminiAccounts({
   return report
 }
 
-export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
+export function createGeminiTerminal({ proxyPool, geminiOwnersRepo = null, callHost = callGeminiHost }) {
   return createGeminiTerminalBridge({
     callHost,
     async resolveTarget(id) {
@@ -1246,11 +1257,12 @@ export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
       if (typeof environment.proxy_id !== 'string' || !ID.test(environment.proxy_id)) {
         throw hostError('gemini_proxy_unavailable', 409)
       }
+      const ownerUserId = geminiOwnersRepo?.getOwner ? normalizeOwnerId(geminiOwnersRepo.getOwner(id)) : null
       const pool = proxyPool()
-      const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id)
+      const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id, { ownerUserId })
       return {
         proxy_id: environment.proxy_id,
-        proxy_url: proxyFor(pool, environment.proxy_id),
+        proxy_url: proxyFor(pool, environment.proxy_id, { ownerUserId }),
         ...(egressOptions ? { egress_options: egressOptions } : {}),
       }
     },
