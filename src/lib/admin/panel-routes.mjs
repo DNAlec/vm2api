@@ -283,12 +283,14 @@ import { DEFAULT_MAX_REQUEST_BYTES, reloadActiveVm } from '../core/config.mjs'
 import {
   OS_CATALOG,
   kernelForIndex,
+  normalizeOsKernel,
   normalizeTimezone,
   nextNumericIndex,
   padVm,
   discardSlotContainer,
   STANDARD_LOCALE,
 } from '../vm/vm-runtime.mjs'
+import { isCragDebian13Kernel } from '../vm/custom-os-runtime.mjs'
 import {
   startSlotReady,
   reloadSlotReady,
@@ -336,7 +338,12 @@ import {
   takenFingerprintKeys,
   writeGuestMachineIdFile,
 } from '../identity/workstation-fingerprint.mjs'
-import { assignComputerFingerprint } from '../identity/slot-computer.mjs'
+import {
+  assignComputerFingerprint,
+  fingerprintDir,
+  pushLiveSlotTimezoneSync,
+  syncSlotIdentityTimezoneAndPreset,
+} from '../identity/slot-computer.mjs'
 import { runFleetUpdate, fleetStatus } from '../vm/fleet-update.mjs'
 import {
   captureWrapSample,
@@ -358,9 +365,12 @@ import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
 import {
   createCragShopHandler,
+  createGeminiCragShopHandler,
   cragShopRoute,
+  geminiCragShopRoute,
   isCragDeviceShopPath,
   isCragShopPath,
+  isGeminiCragShopPath,
   sameOriginPost,
 } from './crag-shop.mjs'
 import { createCragSubscriptionHandler, cragSubscriptionRoute } from './crag-subscription-routes.mjs'
@@ -386,7 +396,7 @@ import {
 } from '../vm/crag-license.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
-import { normalizeHealthProbeConfig } from './health-probe.mjs'
+import { listPlatformCatalogModels, normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
 import {
   isNotifyChannel,
@@ -815,6 +825,7 @@ export function createPanelHandler(ctx) {
     panelUsers: ctx.panelUsers || null,
     requestLog: ctx.requestLog || null,
     billingReady: Boolean(ctx.requestLog),
+    publicBaseUrl: ctx.cfg?.base_url || null,
   })
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
@@ -837,16 +848,28 @@ export function createPanelHandler(ctx) {
   const refreshCluster = ctx.refreshClusterSlotPayloads || refreshClusterSlotPayloads
   const requireAuth = (...args) => ctx.requireAuth(...args)
   const cfg = ctx.cfg
+  const isShopCurrentAdmin = (req) => {
+    const record = ctx.panelUsers.getByUsername(req.panelUser)
+    if (record) return record.enabled && record.role === 'admin' && req.panelBuyerOwner === `panel:${record.id}`
+    return req.panelBuyerOwner === `configured-admin:${req.panelUser}`
+  }
   const handleCragShop =
     ctx.handleCragShop ??
     createCragShopHandler({
       getDb: ctx.getDb,
       subscription: ctx.cragSubscription,
-      isCurrentAdmin: (req) => {
-        const record = ctx.panelUsers.getByUsername(req.panelUser)
-        if (record) return record.enabled && record.role === 'admin' && req.panelBuyerOwner === `panel:${record.id}`
-        return req.panelBuyerOwner === `configured-admin:${req.panelUser}`
-      },
+      isCurrentAdmin: isShopCurrentAdmin,
+      dataDir: cfg?.paths?.data,
+      publicBaseUrl: cfg?.base_url,
+      json,
+      readRawBody,
+    })
+  const handleGeminiCragShop =
+    ctx.handleGeminiCragShop ??
+    createGeminiCragShopHandler({
+      getDb: ctx.getDb,
+      subscription: ctx.geminiCragSubscription,
+      isCurrentAdmin: isShopCurrentAdmin,
       dataDir: cfg?.paths?.data,
       publicBaseUrl: cfg?.base_url,
       json,
@@ -990,7 +1013,10 @@ export function createPanelHandler(ctx) {
     if (!hasBoundExit(vm.proxy)) {
       startError = 'no_exit'
     } else {
-      const boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig, bindSubscription })
+      const boot = await (ctx.startSlotReady || startSlotReady)(vm, cfg.paths.project, {
+        routing: ctx.routingConfig,
+        bindSubscription,
+      })
       vm = getVm(cfg.paths.project, id) || vm
       if (!boot?.ok) {
         startError = boot?.error || boot?.reason || 'runtime start failed'
@@ -1466,6 +1492,14 @@ export function createPanelHandler(ctx) {
       targetDataplane !== 'crag' &&
       !isCodexVm(desired) &&
       typeof ctx.cragSubscription?.releaseStoppedBinding === 'function'
+    if (!isCodexVm(desired) && isCragDebian13Kernel(desired.kernel) && targetDataplane !== 'crag') {
+      return {
+        ok: false,
+        id,
+        code: 'crag_debian13_crag_only',
+        error: 'crag-debian13 槽位仅支持 CRAG 推理数据面，不能切换为 cli-node/wrap',
+      }
+    }
     if (kernelSwitch && targetDataplane === 'crag' && targetVersion === 'v2') {
       if (isNativeNodeVm(desired)) {
         return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
@@ -1761,6 +1795,7 @@ export function createPanelHandler(ctx) {
     ctx.routingConfig = previous
     ctx.healthMonitor?.setConfig(ctx.routingConfig.health_probe)
     ctx.usageProbeMonitor?.setConfig(ctx.routingConfig.usage_probe)
+    ctx.warmupMonitor?.setConfig(ctx.routingConfig.warmup)
     ctx.cragZombieGuard?.setConfig(ctx.routingConfig.crag_zombie_guard)
     ctx.notifyMonitor?.setConfig(ctx.routingConfig.notify)
     if (ctx.routingConfig.logging) {
@@ -2113,6 +2148,21 @@ export function createPanelHandler(ctx) {
       return handleCragShop(req, res, url, route)
     }
 
+    if (isGeminiCragShopPath(p)) {
+      res.setHeader('Cache-Control', 'no-store')
+      const route = geminiCragShopRoute(req.method, p)
+      if (route === 'plans') {
+        requireAuth(req, res, { buyer: true, optionalBuyer: true })
+        if (res.headersSent) return true
+        return handleGeminiCragShop(req, res, url, route)
+      }
+      if (!requireAuth(req, res, { buyer: true })) return true
+      if (route && !authorizePanelRoute(req.method, p, panelIdentity(req).role).ok) {
+        return json(res, 403, { ok: false, error: { code: 'forbidden', message: 'Forbidden' } })
+      }
+      return handleGeminiCragShop(req, res, url, route)
+    }
+
     if (p.startsWith('/api/panel')) {
       const delegated = req[INTEGRATION_DELEGATED] === true
       if (delegated) {
@@ -2302,6 +2352,14 @@ export function createPanelHandler(ctx) {
           return json(res, 400, {
             ok: false,
             error: { code: 'kernel_switch_unsupported', message: '当前槽位不支持切换 Claude 内核' },
+          })
+        if (isCragDebian13Kernel(vm.kernel) && body.dataplane !== 'crag')
+          return json(res, 400, {
+            ok: false,
+            error: {
+              code: 'crag_debian13_crag_only',
+              message: 'crag-debian13 槽位仅支持 CRAG 推理数据面，不能切换为 cli-node/wrap',
+            },
           })
         // readBody yielded: reserve only after checking the latest admission state.
         if (kernelSwitchJobs.get(id)?.status === 'running')
@@ -4794,6 +4852,18 @@ export function createPanelHandler(ctx) {
           if (hasAuthScheme) {
             const vm = persistSlotAuthScheme(cfg.paths.project, id, body.auth_scheme || body.authScheme)
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            try {
+              const host = slotHost(vm)
+              await (host.syncCredentials || host.onImport)?.(vm, path.join(cfg.paths.project, 'vms', id))
+            } catch (error) {
+              return json(res, 502, {
+                ok: false,
+                error: {
+                  code: 'credential_sync_failed',
+                  message: String(error?.message || 'failed to sync auth_scheme to slot'),
+                },
+              })
+            }
           }
           let slotPolicyResult = null
           if (hasSlotPolicy) {
@@ -4811,7 +4881,8 @@ export function createPanelHandler(ctx) {
                   ? 404
                   : slotPolicyResult.code?.startsWith('license_')
                     ? 403
-                    : slotPolicyResult.code === 'gpt_engine_forbidden'
+                    : slotPolicyResult.code === 'gpt_engine_forbidden' ||
+                        slotPolicyResult.code === 'crag_debian13_crag_only'
                       ? 400
                       : 503
               return json(res, status, {
@@ -4832,17 +4903,30 @@ export function createPanelHandler(ctx) {
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
           }
           if (hasTimezone) {
+            const prevZone = currentVm.timezone || ''
             const vm = persistVmTimezone(cfg.paths.project, id, timezoneSync.timezone, { source: 'manual' })
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
             const kernel = projectSlotKernelConfig(vm)
             timezoneSync.applied = true
             timezoneSync.kernel_hot = kernel?.changed === true
+            const freshVm = getVm(cfg.paths.project, id)
+            if (freshVm?.status === 'running') {
+              if (freshVm.runtime?.type === 'kvm') {
+                await pushLiveSlotTimezoneSync(cfg.paths.project, freshVm).catch(() => null)
+              } else if (prevZone !== timezoneSync.timezone) {
+                timezoneSync.restart_recommended_for_tz = true
+              }
+            }
           } else if (followProxyTz) {
             const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
             timezoneSync = { applied: synced.applied, timezone: synced.timezone, source: 'proxy_geo' }
             if (synced.applied) {
               const kernel = projectSlotKernelConfig({ id })
               timezoneSync.kernel_hot = kernel?.changed === true
+              const freshVm = getVm(cfg.paths.project, id)
+              if (freshVm?.status === 'running' && freshVm.runtime?.type !== 'kvm') {
+                timezoneSync.restart_recommended_for_tz = true
+              }
             }
           }
           if (nextName != null && nextName !== String(currentVm.name || '')) {
@@ -5701,6 +5785,18 @@ export function createPanelHandler(ctx) {
           vm.seed_policy = next
           vm.updated_at = new Date().toISOString()
           atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          if (fs.existsSync(fingerprintDir(cfg.paths.project, id))) {
+            try {
+              const tzSync = syncSlotIdentityTimezoneAndPreset(cfg.paths.project, vm, {
+                timezone: vm.timezone,
+                locale: vm.locale,
+                telemetryEnabled: isTelemetryEnabled(next),
+              })
+              if (tzSync?.ok && vm.status === 'running' && vm.runtime?.type === 'kvm') {
+                await pushLiveSlotTimezoneSync(cfg.paths.project, vm, tzSync).catch(() => null)
+              }
+            } catch {}
+          }
           let service
           if (unsupported) {
             service = await withVmLock(`seed-publication:${vmPath}`, async () => {
@@ -6012,18 +6108,26 @@ export function createPanelHandler(ctx) {
           }
         }
         const startNow = body.start !== false && body.status !== 'stopped'
-        const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
+        const wantKernel = normalizeOsKernel(body.kernel) || kernelForIndex(idx)
+        const cragDebian13Create = isCragDebian13Kernel(wantKernel)
         let nodeId = body.node_id ? String(body.node_id) : null
         const kindProbe = {}
         stampVmKind(kindProbe, body)
         const codexCreate = isCodexVm(kindProbe)
+        if (codexCreate && cragDebian13Create) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_create_dataplane', message: 'crag-debian13 仅支持 Anthropic CRAG 槽位' },
+          })
+        }
         if (Object.hasOwn(body, 'dataplane') && (codexCreate || !['wrap', 'crag'].includes(body.dataplane))) {
           return json(res, 400, {
             ok: false,
             error: { code: 'invalid_create_dataplane', message: '仅 Anthropic 支持选择 cli-node 或 CRAG 推理内核' },
           })
         }
-        const selectedCrag = body.dataplane === 'crag'
+        const effectiveDataplane = !codexCreate ? (cragDebian13Create ? 'crag' : (body.dataplane ?? 'wrap')) : undefined
+        const selectedCrag = !codexCreate && effectiveDataplane === 'crag'
         const unsupportedCrag = () =>
           json(res, 409, {
             ok: false,
@@ -6284,7 +6388,7 @@ export function createPanelHandler(ctx) {
         }
         if (nodeId) vm.node_id = nodeId
         stampVmKind(vm, body)
-        if (!codexCreate) vm.dataplane = body.dataplane ?? 'wrap'
+        if (!codexCreate) vm.dataplane = effectiveDataplane
         if (selectedCrag) {
           vm.crag_kernel_version = 'v2'
           // Do not publish a running record before the selected CRAG has passed licensing.
@@ -6420,7 +6524,7 @@ export function createPanelHandler(ctx) {
         if (!startError && startNow && hasExit(vm)) {
           let boot
           try {
-            boot = await startSlotReady(vm, cfg.paths.project, {
+            boot = await (ctx.startSlotReady || startSlotReady)(vm, cfg.paths.project, {
               routing: ctx.routingConfig,
               bindSubscription: createBindSubscription,
             })
@@ -7229,6 +7333,17 @@ export function createPanelHandler(ctx) {
         return json(res, 200, result)
       }
       if (req.method === 'GET' && p === '/api/panel/health-probe') {
+        let geminiCatalog = null
+        try {
+          if (typeof ctx.geminiScheduler?.catalog === 'function') {
+            geminiCatalog = await ctx.geminiScheduler.catalog()
+          }
+        } catch {}
+        const catalog = {
+          anthropic: listPlatformCatalogModels('anthropic'),
+          openai: listPlatformCatalogModels('openai'),
+          google: listPlatformCatalogModels('google', { geminiCatalog }),
+        }
         return json(
           res,
           200,
@@ -7236,6 +7351,7 @@ export function createPanelHandler(ctx) {
             config: ctx.healthMonitor?.getConfig?.() || ctx.routingConfig.health_probe,
             snapshot: ctx.healthMonitor?.getSnapshot?.() || null,
             snapshots: ctx.healthMonitor?.getSnapshots?.() || null,
+            catalog,
           }),
         )
       }
@@ -7243,7 +7359,19 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 4096).catch(() => ({}))
         const platform =
           typeof body?.platform === 'string' && body.platform.trim() ? body.platform.trim().toLowerCase() : 'all'
-        const snapshot = await ctx.healthMonitor.runRealProbe({ platform })
+        const model = typeof body?.model === 'string' ? body.model.trim() : ''
+        const snapshot = await ctx.healthMonitor.runRealProbe({ platform, ...(model ? { model } : {}) })
+        let geminiCatalog = null
+        try {
+          if (typeof ctx.geminiScheduler?.catalog === 'function') {
+            geminiCatalog = await ctx.geminiScheduler.catalog()
+          }
+        } catch {}
+        const catalog = {
+          anthropic: listPlatformCatalogModels('anthropic'),
+          openai: listPlatformCatalogModels('openai'),
+          google: listPlatformCatalogModels('google', { geminiCatalog }),
+        }
         return json(
           res,
           200,
@@ -7251,6 +7379,7 @@ export function createPanelHandler(ctx) {
             config: ctx.healthMonitor.getConfig(),
             snapshot,
             snapshots: ctx.healthMonitor.getSnapshots?.() || null,
+            catalog,
           }),
         )
       }

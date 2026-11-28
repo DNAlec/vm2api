@@ -34,7 +34,7 @@ export const POOL_LOCKED_DEFAULTS = {
   session_ttl_seconds: 86400, // 24 小时
   session_overflow_policy: 'spill_immediately' as SessionOverflowPolicy, // D2: 满了就换
   session_busy_wait_ms: 0, // D2: 零干等
-  system_prompt_mode: 'passthrough' as SystemPromptMode,
+  system_prompt_mode: 'inherit_global' as SystemPromptMode,
   system_prompt_preset: 'official_full' as SystemPromptPreset,
   system_prompt_text: '',
   client_system_policy: 'prepend_pool' as ClientSystemPolicy,
@@ -94,9 +94,25 @@ export const SYSTEM_PROMPT_MODE_LABELS: Record<SystemPromptMode, string> = {
 }
 
 export const SYSTEM_PROMPT_PRESET_LABELS: Record<SystemPromptPreset, string> = {
-  official_full: 'official_full（官方完整）',
-  official: 'official（官方精简）',
-  official_303: 'official_303（303 版）',
+  official_full: 'official_full（完整官方提示词）',
+  official: 'official（官方提示词 · 仅身份默认）',
+}
+
+/** 规范化分组池官方人设预设：退役的 `official_303` 读时自动归一化为 `official_full`。 */
+export function normalizePoolPromptPreset(raw: unknown): SystemPromptPreset {
+  const s = String(raw || '')
+    .trim()
+    .toLowerCase()
+  if (
+    s === 'official' ||
+    s === 'official_prompt' ||
+    s === 'prompt' ||
+    s === 'agent_prompt' ||
+    s === 'cc_prompt'
+  ) {
+    return 'official'
+  }
+  return 'official_full'
 }
 
 export const CLIENT_SYSTEM_POLICY_LABELS: Record<ClientSystemPolicy, string> = {
@@ -161,6 +177,12 @@ export function isPromptLockedProvider(
   return normalized === 'openai' || normalized === 'google'
 }
 
+export function defaultSystemPromptModeForProvider(
+  scope: ProviderScope | string | undefined
+): SystemPromptMode {
+  return isPromptLockedProvider(scope) ? 'passthrough' : 'inherit_global'
+}
+
 export function createDefaultPoolDraft(
   overrides: Partial<SchedulerPoolDraft> = {}
 ): SchedulerPoolDraft {
@@ -192,13 +214,20 @@ export function createDefaultPoolDraft(
     session_ttl_seconds: POOL_LOCKED_DEFAULTS.session_ttl_seconds,
     session_busy_wait_ms: POOL_LOCKED_DEFAULTS.session_busy_wait_ms,
     session_overflow_policy: POOL_LOCKED_DEFAULTS.session_overflow_policy,
-    system_prompt_mode: locked ? 'passthrough' : 'inherit_global',
+    system_prompt_mode: defaultSystemPromptModeForProvider(provider_scope),
     system_prompt_preset: POOL_LOCKED_DEFAULTS.system_prompt_preset,
     system_prompt_text: '',
     client_system_policy: POOL_LOCKED_DEFAULTS.client_system_policy,
     jev_profile: POOL_LOCKED_DEFAULTS.jev_profile,
   }
-  const merged: SchedulerPoolDraft = { ...base, ...overrides, provider_scope }
+  const merged: SchedulerPoolDraft = {
+    ...base,
+    ...overrides,
+    provider_scope,
+    system_prompt_preset: normalizePoolPromptPreset(
+      overrides.system_prompt_preset ?? base.system_prompt_preset
+    ),
+  }
   if (locked) {
     merged.system_prompt_mode = 'passthrough'
     merged.system_prompt_text = ''
@@ -249,8 +278,8 @@ export function poolToDraft(pool: SchedulerPool): SchedulerPoolDraft {
       POOL_LOCKED_DEFAULTS.session_overflow_policy,
     system_prompt_mode: locked
       ? 'passthrough'
-      : pool.system_prompt_mode || 'passthrough',
-    system_prompt_preset: pool.system_prompt_preset || 'official_full',
+      : pool.system_prompt_mode || defaultSystemPromptModeForProvider(scope),
+    system_prompt_preset: normalizePoolPromptPreset(pool.system_prompt_preset),
     system_prompt_text: locked ? '' : pool.system_prompt_text || '',
     client_system_policy: pool.client_system_policy || 'prepend_pool',
     jev_profile: pool.jev_profile || 'inherit_global',
@@ -410,7 +439,7 @@ export function buildPoolPayload(
     session_overflow_policy: draft.session_overflow_policy,
     session_busy_wait_ms: sessionBusyWait,
     system_prompt_mode: mode,
-    system_prompt_preset: draft.system_prompt_preset,
+    system_prompt_preset: normalizePoolPromptPreset(draft.system_prompt_preset),
     system_prompt_text: text,
     client_system_policy: draft.client_system_policy,
     jev_profile: draft.jev_profile,

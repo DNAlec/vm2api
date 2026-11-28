@@ -13,21 +13,21 @@ import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
 import { inboundBodyLimit, readRoutingConfigFile } from '../core/config.mjs'
-import {
-  detectProxiedOfficialCcFromRouting,
-  isOfficialClaudeCodeTraffic,
-  isProxiedOfficialClaudeCode,
-} from '../identity/crs-persona.mjs'
+import { verifyOfficialClaudeCode } from '../identity/official-cc-verifier.mjs'
 import {
   claudeCodeOnlyError,
   claudeCodeOnlyFromRouting,
   isClaudeCodeFamilyRequest,
 } from '../identity/claude-code-only.mjs'
+import { toStandardAnthropicBody } from './anthropic-policy.mjs'
+import { relocateThirdPartySystem } from './third-party-system.mjs'
+import { foldThirdPartyRoleSystemMessages } from './outbound-attempt.mjs'
 import { canCountTokens, canOfficialUsage, credentialModeOfVm, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { attachUsageFetchMeta, getUsageCache, getUsageFetchMeta } from '../oauth/usage-cache.mjs'
 import { probeAccount } from '../oauth/usage-probe.mjs'
 import { isOfficialUsageRateLimited, shouldHopOfficialUsage } from '../oauth/crs-usage-probe.mjs'
-import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
+import { countTokensViaKernel, countTokensViaWorker } from '../transport/go-worker-client.mjs'
+import { peekRustHealth } from '../transport/kernel-router.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 import { listQuotaFromHeaders, publicUsageWindow, usageWindowsEmpty } from '../pool/quota-window.mjs'
 import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
@@ -179,7 +179,26 @@ function sendPoolFail(res, json, peeked) {
   return json(res, mapped.status, mapped.body)
 }
 
-function distillContext(req, inbound, { effectivePool = null, routing: routingArg = null, nodeProvider = null } = {}) {
+export function sanitizeThirdPartyCountTokensBody(body, { routing = null } = {}) {
+  if (!body || typeof body !== 'object') return body
+  const relocated = relocateThirdPartySystem(body, { onlyForeign: false })
+  const folded = foldThirdPartyRoleSystemMessages(relocated.moved ? relocated.body : body)
+  const standard = toStandardAnthropicBody(folded, {
+    official: false,
+    rewriteTools: routing?.compatibility?.tool_name_rewrite !== false,
+    preserveToolNames: false,
+  })
+  const out = { ...standard.body }
+  // /v1/messages/count_tokens rejects max_tokens (added by sanitizeAnthropicBody default).
+  delete out.max_tokens
+  return out
+}
+
+function distillContext(
+  req,
+  inbound,
+  { effectivePool = null, routing: routingArg = null, nodeProvider = null, official: officialOverride = null } = {},
+) {
   let routing = routingArg
   if (!routing) {
     try {
@@ -189,8 +208,10 @@ function distillContext(req, inbound, { effectivePool = null, routing: routingAr
     }
   }
   const official =
-    isOfficialClaudeCodeTraffic(req?.headers || {}, inbound) ||
-    (detectProxiedOfficialCcFromRouting(routing || {}) && isProxiedOfficialClaudeCode(inbound, req?.headers || {}))
+    typeof officialOverride === 'boolean'
+      ? officialOverride
+      : verifyOfficialClaudeCode(req?.headers || {}, inbound, { routing: routing || {}, countTokens: true })
+          .official === true
   const zeroInject = isPoolZeroInjectMode(effectivePool, routing || {}, { nodeProvider })
   return { official, zeroInject }
 }
@@ -253,6 +274,7 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
       effectivePool: deps.effectivePool || null,
       routing: deps.routing || null,
       nodeProvider: deps.nodeProvider || null,
+      official: deps.official,
     }),
     distillRules: deps.cfg?.distill,
     policy: refusalPolicy(deps),
@@ -264,6 +286,62 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
     account: deps.account || null,
   })
   return { error: decision?.action === 'block' ? decision.error : null, wait: decision.wait === true }
+}
+
+function slotCapabilitiesForCountTokens(peeked, deps) {
+  const sources = [
+    peeked?.workerStatus?.capabilities,
+    peeked?.state?.worker_status?.capabilities,
+    peeked?.exec?.workerStatus?.capabilities,
+    peeked?.vm?.workerStatus?.capabilities,
+    peeked?.vm?.worker_status?.capabilities,
+    peeked?.vm?.runtime?.capabilities,
+    peeked?.vm?.kernel_installation?.capabilities,
+    peekRustHealth(peeked?.exec, 60_000)?.health?.capabilities,
+  ]
+  for (const caps of sources) {
+    if (Array.isArray(caps) && caps.length) return caps
+  }
+  if (typeof deps?.slotCapabilities === 'function') {
+    const caps = deps.slotCapabilities(peeked)
+    if (Array.isArray(caps)) return caps
+  }
+  return []
+}
+
+function sendCountTokensHopResult(res, json, hop, { preserveOfficialErrors = false } = {}) {
+  const forwardHeaders = hop?.headers && typeof hop.headers === 'object' ? { ...hop.headers } : null
+  if (!hop?.ok) {
+    const status = hop?.status && hop.status >= 400 ? hop.status : 502
+    // Upstream limit / overload: same mapping and Retry-After as Messages.
+    if (status === 429 || status === 529) {
+      const mapped = mapUpstreamError(status, hop?.body, forwardHeaders || {})
+      const mergedHeaders = forwardHeaders ? { ...forwardHeaders } : {}
+      const hasRetryAfter = Object.keys(mergedHeaders).some((k) => k.toLowerCase() === 'retry-after')
+      if (mapped.retryAfterSec) {
+        if (!hasRetryAfter) mergedHeaders['retry-after'] = String(mapped.retryAfterSec)
+        res.setHeader?.('retry-after', String(mapped.retryAfterSec))
+      }
+      return forwardHeaders
+        ? json(res, mapped.status, mapped.body, mergedHeaders)
+        : json(res, mapped.status, mapped.body)
+    }
+    if (preserveOfficialErrors && hop?.body?.type === 'error' && hop.body.error && typeof hop.body.error === 'object') {
+      return forwardHeaders ? json(res, status, hop.body, forwardHeaders) : json(res, status, hop.body)
+    }
+    const err = hop?.body?.error || {}
+    const errBody = makeError({
+      type: err.type || ErrorType.UPSTREAM,
+      code: err.code || 'count_tokens_failed',
+      message: err.message || 'count_tokens 失败',
+      status,
+    }).body
+    return forwardHeaders ? json(res, status, errBody, forwardHeaders) : json(res, status, errBody)
+  }
+  const raw = hop.body && typeof hop.body === 'object' ? hop.body : {}
+  const inputTokens = Number(raw.input_tokens)
+  const payload = { ...raw, input_tokens: Number.isFinite(inputTokens) ? inputTokens : 0 }
+  return forwardHeaders ? json(res, 200, payload, forwardHeaders) : json(res, 200, payload)
 }
 
 export async function handleUserCountTokens(req, res, deps) {
@@ -295,21 +373,25 @@ export async function handleUserCountTokens(req, res, deps) {
   if (!parsed.ok) return json(res, parsed.error.status, parsed.error.body)
   const modelDenied = keyModelError(req, parsed.body.model, { anthropic: true })
   if (modelDenied) return json(res, modelDenied.status, modelDenied.body)
+  const targetPlatform = detectInboundPlatform(parsed.body.model).platform || 'anthropic'
+  const ccVerdict =
+    targetPlatform === 'anthropic'
+      ? verifyOfficialClaudeCode(req?.headers || {}, inbound, { routing: routing || {}, countTokens: true })
+      : { official: false }
+  const officialTraffic = ccVerdict.official === true
   if (
     claudeCodeOnlyFromRouting(routing) &&
-    detectInboundPlatform(parsed.body.model).platform === 'anthropic' &&
-    !isClaudeCodeFamilyRequest(req?.headers || {}, inbound, { countTokens: true })
+    targetPlatform === 'anthropic' &&
+    !isClaudeCodeFamilyRequest(req?.headers || {}, inbound, { routing, countTokens: true })
   ) {
     const err = claudeCodeOnlyError()
     return json(res, err.status, err.body)
   }
-  const blockedClient =
-    detectInboundPlatform(parsed.body.model).platform === 'anthropic' ? blockedClientFor(inbound, routing) : null
+  const blockedClient = targetPlatform === 'anthropic' ? blockedClientFor(inbound, routing) : null
   if (blockedClient) {
     const err = blockedClientError(blockedClient)
     return json(res, err.status, err.body)
   }
-  const targetPlatform = detectInboundPlatform(parsed.body.model).platform || 'anthropic'
   if (targetPlatform === 'anthropic') {
     try {
       validateImageDimensions(parsed.body)
@@ -371,6 +453,7 @@ export async function handleUserCountTokens(req, res, deps) {
     effectivePool,
     routing,
     nodeProvider: targetPlatform,
+    official: officialTraffic,
   })
   if (gate?.error) {
     if (gate.error.retryAfterSec) res.setHeader?.('retry-after', String(gate.error.retryAfterSec))
@@ -393,12 +476,23 @@ export async function handleUserCountTokens(req, res, deps) {
       effectivePool,
       routing,
       nodeProvider: targetPlatform,
+      official: officialTraffic,
       account: scopeAccountFromVm(peeked.vm, findAccount(deps.accountQuota, peeked.vm)?.unified),
     })
     if (again?.error) {
       if (again.error.retryAfterSec) res.setHeader?.('retry-after', String(again.error.retryAfterSec))
       return json(res, again.error.status, again.error.body)
     }
+  }
+  const outboundBody = officialTraffic ? parsed.body : sanitizeThirdPartyCountTokensBody(parsed.body, { routing })
+  const caps = slotCapabilitiesForCountTokens(peeked, deps)
+  if (caps.includes('count_tokens_v1')) {
+    const hop = await (deps.countTokensViaKernel || countTokensViaKernel)(peeked.exec, {
+      body: outboundBody,
+      headers: {},
+      timeoutMs: 45000,
+    })
+    return sendCountTokensHopResult(res, json, hop, { preserveOfficialErrors: true })
   }
   const mode = credentialModeOfVm(peeked.vm)
   if (!canCountTokens(mode)) {
@@ -414,37 +508,15 @@ export async function handleUserCountTokens(req, res, deps) {
     return json(res, 200, buildUsageView(listed, source))
   }
   const hop = await (deps.countTokensViaWorker || countTokensViaWorker)(peeked.exec, {
-    body: parsed.body,
+    body: outboundBody,
     headers: {
       'user-agent': 'kin-inference/1.0',
       'anthropic-version': '2023-06-01',
-      'anthropic-beta': isApiKeyMode(mode) ? apiKeyBetaHeader('') : setupTokenBetaHeader(parsed.body.model),
+      'anthropic-beta': isApiKeyMode(mode) ? apiKeyBetaHeader('') : setupTokenBetaHeader(outboundBody.model),
     },
     timeoutMs: 45000,
   })
-  if (!hop.ok) {
-    const status = hop.status && hop.status >= 400 ? hop.status : 502
-    // Upstream limit / overload: same mapping and Retry-After as Messages.
-    if (status === 429 || status === 529) {
-      const mapped = mapUpstreamError(status, hop.body, hop.headers || {})
-      if (mapped.retryAfterSec) res.setHeader?.('retry-after', String(mapped.retryAfterSec))
-      return json(res, mapped.status, mapped.body)
-    }
-    const err = hop.body?.error || {}
-    return json(
-      res,
-      status,
-      makeError({
-        type: err.type || ErrorType.UPSTREAM,
-        code: err.code || 'count_tokens_failed',
-        message: err.message || 'count_tokens 失败',
-        status,
-      }).body,
-    )
-  }
-  const raw = hop.body && typeof hop.body === 'object' ? hop.body : {}
-  const inputTokens = Number(raw.input_tokens)
-  return json(res, 200, { ...raw, input_tokens: Number.isFinite(inputTokens) ? inputTokens : 0 })
+  return sendCountTokensHopResult(res, json, hop)
 }
 
 export async function resolveUsageWindows({

@@ -31,6 +31,7 @@ import {
   sessionIdForLog,
 } from '../protocol/log-fields.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
+import { sameOriginPost } from '../admin/crag-shop.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
 import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
 import { normalizeGeminiOAuthImport } from './oauth-import.mjs'
@@ -434,10 +435,16 @@ function hostRequest(socketPath, operation, payload) {
                 : null
             throw hostError(data.code, response.statusCode, stage ? { stage } : null)
           }
+          if (!terminal && operation !== 'redeem' && response.statusCode === 401 && !data?.code)
+            throw hostError('gemini_oauth_required', 401)
+          if (!terminal && operation !== 'redeem' && response.statusCode === 403 && !data?.code)
+            throw hostError('gemini_account_ineligible', 403)
           if (!terminal && operation !== 'redeem' && response.statusCode === 404)
             throw hostError('gemini_environment_not_found', 404)
           if (!terminal && operation !== 'redeem' && response.statusCode === 409)
             throw hostError('gemini_environment_conflict', 409)
+          if (!terminal && operation !== 'redeem' && response.statusCode === 429 && !data?.code)
+            throw hostError('gemini_quota_exhausted', 429)
           if (terminal && response.statusCode === 404) throw hostError('gemini_terminal_unavailable')
           if (response.statusCode !== 200) throw hostError(FAILURE)
           resolve(data)
@@ -796,8 +803,20 @@ function environmentView(
       ? { active_slots: value.active_slots }
       : {}),
     ...(resolvedInflight != null ? { inflight: resolvedInflight } : {}),
-    models: items(value.models, 128, modelName),
-    ...(value.models_discovered === true && { models_discovered: true }),
+    models: items(
+      Array.isArray(value.models) && value.models.length
+        ? value.models
+        : Array.isArray(value.call_models)
+          ? value.call_models
+          : value.models,
+      128,
+      modelName,
+    ),
+    ...(Array.isArray(value.call_models) ? { call_models: items(value.call_models, 128, modelName) } : {}),
+    ...((value.models_discovered === true ||
+      (Array.isArray(value.call_models) && items(value.call_models, 128, modelName).length > 0)) && {
+      models_discovered: true,
+    }),
     ...(Array.isArray(value.capabilities)
       ? {
           capabilities: items(value.capabilities, 32, (c) =>
@@ -1265,6 +1284,7 @@ export function createGeminiPanelHandler({
   requestLog = null,
   callHost = callGeminiHost,
   billingReady = Boolean(requestLog),
+  publicBaseUrl = null,
 }) {
   const maintenance = createGeminiMaintenanceHandler({ json, readBody })
   const slotPrefs = geminiSlotPrefs || createGeminiSlotPrefs()
@@ -1342,6 +1362,25 @@ export function createGeminiPanelHandler({
         const sync = syncParam === '1' || syncParam === 'true'
         return ok(await cragSubscription.status({ sync }))
       }
+      if (req.method === 'GET' && pathname === `${PANEL_PATH}/crag-subscription/orders`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        const reqUrl = new URL(req.url || pathname, 'http://127.0.0.1')
+        const rawLimit = reqUrl.searchParams.get('limit')
+        const rawOffset = reqUrl.searchParams.get('offset')
+        const limit = rawLimit == null ? 50 : Number(rawLimit)
+        const offset = rawOffset == null ? 0 : Number(rawOffset)
+        if (
+          !Number.isInteger(limit) ||
+          limit < 1 ||
+          limit > 200 ||
+          !Number.isInteger(offset) ||
+          offset < 0 ||
+          offset > 1_000_000
+        ) {
+          return fail(400, 'invalid_request', GEMINI_LICENSE_MESSAGES.invalid_request)
+        }
+        return ok(await cragSubscription.orders({ limit, offset }))
+      }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/sync`) {
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
         if (cragSubscription.hasSyncPending?.()) {
@@ -1354,6 +1393,45 @@ export function createGeminiPanelHandler({
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
         const body = await readBody(req, 2048)
         const out = await cragSubscription.redeem(body?.redemption_code)
+        geminiScheduler?.invalidateCatalogCache?.()
+        return ok(out)
+      }
+      if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/claim-by-order`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        if (req.apiKeyKind !== 'master' && !sameOriginPost(req, publicBaseUrl)) {
+          return fail(403, 'crag_subscription_origin_denied', '请从本面板发起请求')
+        }
+        const body = await readBody(req, 2048)
+        if (typeof body?.order_id !== 'string' || !body.order_id.trim()) {
+          return fail(400, 'invalid_request', GEMINI_LICENSE_MESSAGES.invalid_request)
+        }
+        const out = await cragSubscription.claimByOrder(body.order_id)
+        geminiScheduler?.invalidateCatalogCache?.()
+        return ok(out)
+      }
+      if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/migrate`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        if (req.apiKeyKind !== 'master' && !sameOriginPost(req, publicBaseUrl)) {
+          return fail(403, 'crag_subscription_origin_denied', '请从本面板发起请求')
+        }
+        const body = await readBody(req, 4096)
+        if (typeof body?.from_host_id !== 'string' || !body.from_host_id.trim()) {
+          return fail(400, 'invalid_request', GEMINI_LICENSE_MESSAGES.invalid_request)
+        }
+        const out = await cragSubscription.migrate(body.from_host_id, {
+          proof: body.proof,
+          proof_order_id: body.proof_order_id,
+          proof_redemption_code: body.proof_redemption_code,
+        })
+        geminiScheduler?.invalidateCatalogCache?.()
+        return ok(out)
+      }
+      if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/rebuild-identity`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        if (req.apiKeyKind !== 'master' && !sameOriginPost(req, publicBaseUrl)) {
+          return fail(403, 'crag_subscription_origin_denied', '请从本面板发起请求')
+        }
+        const out = await cragSubscription.rebuildIdentity()
         geminiScheduler?.invalidateCatalogCache?.()
         return ok(out)
       }
@@ -1434,7 +1512,8 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_invalid_concurrency', HOST_ERRORS.gemini_invalid_concurrency[1])
         }
         const imported = body?.oauth_account
-        const normalizedImport = imported != null ? normalizeGeminiOAuthImport(imported) : null
+        const accountIndex = body?.oauth_account_index !== undefined ? body.oauth_account_index : 0
+        const normalizedImport = imported != null ? normalizeGeminiOAuthImport(imported, { accountIndex }) : null
         if (imported != null && (method !== 'oauth' || !normalizedImport)) {
           return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
         }
@@ -1458,6 +1537,9 @@ export function createGeminiPanelHandler({
                 : {}),
               ...(normalizedImport.auth_method ? { auth_method: normalizedImport.auth_method } : {}),
               ...(normalizedImport.wif_provider ? { wif_provider: normalizedImport.wif_provider } : {}),
+              ...(normalizedImport.oauth_client_key ? { oauth_client_key: normalizedImport.oauth_client_key } : {}),
+              ...(typeof normalizedImport.is_gcp_tos === 'boolean' ? { is_gcp_tos: normalizedImport.is_gcp_tos } : {}),
+              ...(normalizedImport.project_id ? { project_id: normalizedImport.project_id } : {}),
             },
           }),
         })
@@ -1648,11 +1730,15 @@ export function createGeminiPanelHandler({
         if (!validId(proxyId)) return fail(400, 'gemini_invalid_proxy_id')
         const environment = await readEnvironment(callHost, id)
         const envOwner = envOwnerOf(id)
+        const pool = proxyPool()
+        const proxyUrl = proxyFor(pool, proxyId, { ownerUserId: envOwner, forBinding: true })
+        const egressOptions = proxyEgressOptionsFor(pool, proxyId, { ownerUserId: envOwner })
         const result = await callHost('proxy-bind', {
           id,
           previous_proxy_id: environment.proxy_id,
           proxy_id: proxyId,
-          proxy_url: proxyFor(proxyPool(), proxyId, { ownerUserId: envOwner, forBinding: true }),
+          proxy_url: proxyUrl,
+          ...(egressOptions ? { egress_options: egressOptions } : {}),
         })
         slotPrefs.clearUnschedulable(id)
         geminiScheduler?.invalidateCatalogCache?.()
@@ -1661,7 +1747,7 @@ export function createGeminiPanelHandler({
       if (req.method === 'POST' && action === 'proxy/probe') {
         const environment = await readEnvironment(callHost, id)
         // Only probing the existing binding may bypass stored health. Scope,
-        // enablement, policy, and valid IPv4 SOCKS5 still apply.
+        // enablement, policy, and valid SOCKS5 / HTTP proxy still apply.
         const target = boundProxy(proxyPool, environment, { allowUnhealthy: true, ownerUserId: envOwnerOf(id) })
         return ok(probeView(await callHost('proxy-probe', { id, ...target })))
       }
@@ -1822,7 +1908,21 @@ export function createGeminiPanelHandler({
             : null
         const resolvedMessage =
           error.code === 'gemini_authorization_unavailable' && stage ? AUTH_STAGE_MESSAGES[stage] : message
-        return fail(status, error.code, resolvedMessage, stage ? { stage } : null)
+        const details = {}
+        if (
+          typeof error.recovery === 'string' &&
+          ['not_activated', 'host_id_collision', 'failed'].includes(error.recovery)
+        ) {
+          details.recovery = error.recovery
+        }
+        if (typeof error.authorityRequestId === 'string' && error.authorityRequestId) {
+          details.authority_request_id = error.authorityRequestId
+        }
+        const extra = {
+          ...(stage ? { stage } : {}),
+          ...(Object.keys(details).length ? { details } : {}),
+        }
+        return fail(status, error.code, resolvedMessage, Object.keys(extra).length ? extra : null)
       }
       if (error?.code === 'gemini_proxy_unavailable') return fail(409, error.code, '需要绑定可用的 SOCKS5 / HTTP 代理')
       if (error?.code === 'gemini_environment_not_found') return fail(404, error.code, 'Gemini 环境不存在')

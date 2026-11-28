@@ -50,9 +50,64 @@ fn default_prompt_preset() -> CompactString {
     CompactString::const_new("official_full")
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Global Codex soft utilization gates (`routing.codex.quota.limit_*` fractions).
+/// Serde field defaults (0.95) preserve legacy Rust admission when JSON omits the object.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CodexQuotaPolicy {
+    #[serde(default = "default_codex_quota_limit_5h")]
+    pub limit_5h: f64,
+    #[serde(default = "default_codex_quota_limit_7d")]
+    pub limit_7d: f64,
+}
+
+fn default_codex_quota_limit_5h() -> f64 {
+    0.95
+}
+
+fn default_codex_quota_limit_7d() -> f64 {
+    0.95
+}
+
+impl Default for CodexQuotaPolicy {
+    fn default() -> Self {
+        Self {
+            limit_5h: default_codex_quota_limit_5h(),
+            limit_7d: default_codex_quota_limit_7d(),
+        }
+    }
+}
+
+impl CodexQuotaPolicy {
+    pub const LEGACY_FALLBACK_PCT: f32 = 95.0;
+
+    pub fn limit_5h_percent(&self) -> f32 {
+        Self::fraction_to_threshold_pct(self.limit_5h)
+    }
+
+    pub fn limit_7d_percent(&self) -> f32 {
+        Self::fraction_to_threshold_pct(self.limit_7d)
+    }
+
+    fn fraction_to_threshold_pct(v: f64) -> f32 {
+        if !v.is_finite() {
+            return Self::LEGACY_FALLBACK_PCT;
+        }
+        let clamped = v.clamp(0.3, 1.0);
+        (clamped * 100.0) as f32
+    }
+}
+
+fn default_global_prompt_mode() -> SystemPromptMode {
+    SystemPromptMode::Official
+}
+
+fn default_pool_prompt_mode() -> SystemPromptMode {
+    SystemPromptMode::InheritGlobal
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GlobalPromptPolicy {
-    #[serde(default)]
+    #[serde(default = "default_global_prompt_mode")]
     pub mode: SystemPromptMode,
     #[serde(default = "default_prompt_preset")]
     pub preset: CompactString,
@@ -60,6 +115,17 @@ pub struct GlobalPromptPolicy {
     pub text: String,
     #[serde(default)]
     pub client_system_policy: ClientSystemPolicy,
+}
+
+impl Default for GlobalPromptPolicy {
+    fn default() -> Self {
+        Self {
+            mode: default_global_prompt_mode(),
+            preset: default_prompt_preset(),
+            text: String::new(),
+            client_system_policy: ClientSystemPolicy::PrependPool,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -74,6 +140,8 @@ pub struct ConfigSnapshot {
     pub pools: Vec<PoolConfig>,
     #[serde(default)]
     pub nodes: Vec<BackendNodeConfig>,
+    #[serde(default)]
+    pub codex_quota: CodexQuotaPolicy,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -123,7 +191,7 @@ pub struct PoolConfig {
     /// Locked D2 default: SpillImmediately.
     #[serde(default)]
     pub session_overflow_policy: SessionOverflowPolicy,
-    #[serde(default)]
+    #[serde(default = "default_pool_prompt_mode")]
     pub system_prompt_mode: SystemPromptMode,
     #[serde(default = "default_prompt_preset")]
     pub system_prompt_preset: CompactString,
@@ -133,6 +201,10 @@ pub struct PoolConfig {
     pub client_system_policy: ClientSystemPolicy,
     #[serde(default)]
     pub jev_profile: JevProfile,
+    /// Optional pool-level runtime capability gate (e.g. `os_kvm_native_smbios`,
+    /// `vsock_transport_v1`). Empty/omitted preserves 100% legacy behavior.
+    #[serde(default)]
+    pub required_runtime_capabilities: Vec<String>,
     #[serde(default)]
     pub members: Vec<PoolMemberConfig>,
 }
@@ -162,11 +234,12 @@ impl Default for PoolConfig {
             session_ttl_seconds: default_session_ttl_seconds(),
             session_busy_wait_ms: 0,
             session_overflow_policy: SessionOverflowPolicy::SpillImmediately,
-            system_prompt_mode: SystemPromptMode::Passthrough,
+            system_prompt_mode: default_pool_prompt_mode(),
             system_prompt_preset: default_prompt_preset(),
             system_prompt_text: String::new(),
             client_system_policy: ClientSystemPolicy::PrependPool,
             jev_profile: JevProfile::InheritGlobal,
+            required_runtime_capabilities: Vec::new(),
             members: Vec::new(),
         }
     }
@@ -244,6 +317,11 @@ pub struct BackendNodeConfig {
     pub capacity: NodeCapacityConfig,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Account/ quota park window end (epoch ms). Bootstrap baseline; telemetry overrides.
+    #[serde(default)]
+    pub temp_unschedulable_until_ms: Option<u64>,
+    #[serde(default)]
+    pub temp_unschedulable_reason: Option<String>,
 }
 
 impl BackendNodeConfig {
@@ -289,4 +367,24 @@ pub struct ApiKeyScope {
     /// Optional legacy per-node allowlist; empty means all pool members allowed.
     #[serde(default)]
     pub allowed_node_keys: Vec<NodeKey>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PoolConfig;
+    use crate::explain::ExcludeReason;
+
+    #[test]
+    fn pool_config_required_runtime_capabilities_defaults_to_empty_for_compat() {
+        let legacy_json = r#"{
+            "id": "pool_legacy",
+            "members": []
+        }"#;
+        let pool: PoolConfig = serde_json::from_str(legacy_json).expect("legacy PoolConfig json");
+        assert!(pool.required_runtime_capabilities.is_empty());
+        assert_eq!(
+            serde_json::to_string(&ExcludeReason::CapabilityMismatch).unwrap(),
+            "\"capability_mismatch\""
+        );
+    }
 }

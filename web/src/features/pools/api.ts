@@ -11,7 +11,9 @@ import { api, isApiError, panelFetch } from '@/lib/api'
 import { hasSession } from '@/lib/session'
 import { parseSseFrames } from '@/features/vm/use-pool-seat-stream'
 import {
+  defaultSystemPromptModeForProvider,
   isPromptLockedProvider,
+  normalizePoolPromptPreset,
   normalizeProviderScope,
   POOL_LOCKED_DEFAULTS,
 } from './pool-rules'
@@ -92,10 +94,8 @@ function normalizePool(raw: Record<string, unknown>): SchedulerPool {
     system_prompt_mode: locked
       ? 'passthrough'
       : (raw.system_prompt_mode as SchedulerPool['system_prompt_mode']) ||
-        'passthrough',
-    system_prompt_preset:
-      (raw.system_prompt_preset as SchedulerPool['system_prompt_preset']) ||
-      POOL_LOCKED_DEFAULTS.system_prompt_preset,
+        defaultSystemPromptModeForProvider(provider_scope),
+    system_prompt_preset: normalizePoolPromptPreset(raw.system_prompt_preset),
     system_prompt_text: locked ? '' : String(raw.system_prompt_text || ''),
     client_system_policy:
       (raw.client_system_policy as SchedulerPool['client_system_policy']) ||
