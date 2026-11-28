@@ -360,13 +360,13 @@ function accountCapabilities(environment) {
   return new Set(environment.auth_method === 'api_key' ? FULL_GEMINI_CAPABILITIES : NATIVE_TUI_CAPABILITIES)
 }
 
-// Only the local restore validator can exempt a failure from node health penalties.
+// Only local tool validators can exempt a failure from node health penalties.
 // An upstream error with the same code/reason must retain normal attribution.
 function isLocalToolContractFailure(failure) {
   return (
     failure?.localError === true &&
-    failure.code === 'gemini_inference_invalid_output' &&
-    failure.upstreamReason === 'undeclared_tool_call'
+    (failure.code === 'gemini_tool_call_required' ||
+      (failure.code === 'gemini_inference_invalid_output' && failure.upstreamReason === 'undeclared_tool_call'))
   )
 }
 
@@ -551,6 +551,8 @@ async function consumeStreamResponse(
       ? `Upstream completed without calling required function "${requiredChoice.slice(5)}".`
       : FAILURES.gemini_tool_call_required[1]
     const err = fail(502, 'gemini_tool_call_required', message)
+    err.localError = true
+    if (Number.isInteger(response.statusCode)) err.upstreamStatus = response.statusCode
     err.timing = timing.snapshot()
     err.usage = result.usage
     throw err

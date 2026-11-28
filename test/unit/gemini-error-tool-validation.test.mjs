@@ -485,63 +485,80 @@ test('local tool validation is request-scoped for release and failover without t
   }
 })
 
-test('real Rust scheduler keeps all accounts available after local tool failures across the pool', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-tool-health-'))
-  const envIds = ['a', 'b', 'c', 'd']
-  let f
-  const runtime = createSchedulerRuntime({
-    getDb: () => null,
-    getVms: () => [],
-    getRoutingConfig: () => ({}),
-    geminiScheduler: { listEnvironments: () => f.scheduler.listEnvironments() },
-    telemetryIntervalMs: 0,
-    clientOptions: {
-      binPath: process.env.KIN_SCHEDULER_BIN,
-      dataDir: dir,
-      socketPath: path.join(dir, 'scheduler.sock'),
-      tokenPath: path.join(dir, 'token'),
-      capFile: path.join(dir, 'cap.json'),
+for (const [label, toolChoice, response, expectedAttempts] of [
+  ['undeclared', 'auto', chunk(['not_declared']), 4],
+  ['named', { type: 'function', name: 'known' }, chunk(['not_declared']), 1],
+  ['allowed-required', { type: 'allowed_tools', mode: 'required', tools }, chunk(['not_declared']), 1],
+  [
+    'required-text',
+    'required',
+    {
+      candidates: [{ content: { role: 'model', parts: [{ text: 'synthetic answer' }] }, finishReason: 'STOP' }],
     },
-  })
-  const slotPrefs = createGeminiSlotPrefs()
-  f = fixture({ runtime, slotPrefs, envIds, frames: [frame(chunk(['not_declared']))] })
-  try {
-    await f.scheduler.catalog()
-    await runtime.start({ waitMs: 5000, startLoops: false })
-    await runtime.pushTelemetryNow()
-    const res = await f.call(requestBody())
-    assert.equal(res.status, 502, res.text)
-    assert.equal(f.calls, 4, 'all four accounts were attempted once')
-    for (const id of envIds) {
-      assert.equal(slotPrefs.resolved(id).unschedulable, null)
-      const leases = []
+    1,
+  ],
+]) {
+  for (const stream of [false, true]) {
+    test(`real Rust scheduler keeps accounts available after ${label} tool failure (stream=${stream})`, async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-tool-health-'))
+      const envIds = ['a', 'b', 'c', 'd']
+      let f
+      const runtime = createSchedulerRuntime({
+        getDb: () => null,
+        getVms: () => [],
+        getRoutingConfig: () => ({}),
+        geminiScheduler: { listEnvironments: () => f.scheduler.listEnvironments() },
+        telemetryIntervalMs: 0,
+        clientOptions: {
+          binPath: process.env.KIN_SCHEDULER_BIN,
+          dataDir: dir,
+          socketPath: path.join(dir, 'scheduler.sock'),
+          tokenPath: path.join(dir, 'token'),
+          capFile: path.join(dir, 'cap.json'),
+        },
+      })
+      const slotPrefs = createGeminiSlotPrefs()
+      f = fixture({ runtime, slotPrefs, envIds, frames: [frame(response)] })
       try {
-        // A cooled node can admit one probe; two simultaneous leases rule that out.
-        for (let i = 0; i < 2; i++) {
-          leases.push(
-            await runtime.acquireNode({
-              originPoolId: '__virtual_gemini__',
-              apiKeyKind: 'master',
-              ownerScope: { type: 'platform' },
-              allowedNodeKeys: [`gemini_env:${id}`],
-              nodeTypes: ['gemini_env'],
-              model,
-              modelFamily: 'gemini',
-              protocol: 'google.gemini',
-              sessionId: crypto.randomUUID(),
-              noQueue: true,
-            }),
-          )
+        await f.scheduler.catalog()
+        await runtime.start({ waitMs: 5000, startLoops: false })
+        await runtime.pushTelemetryNow()
+        const res = await f.call(requestBody({ tool_choice: toolChoice, stream }))
+        assert.equal(res.status, stream ? 200 : 502, res.text)
+        assert.match(res.text, /gemini_inference_invalid_output|gemini_tool_call_required/)
+        assert.equal(f.calls, stream ? 1 : expectedAttempts, 'streamed terminal events must not be retried')
+        for (const id of envIds) {
+          assert.equal(slotPrefs.resolved(id).unschedulable, null)
+          const leases = []
+          try {
+            // A cooled node can admit one probe; two simultaneous leases rule that out.
+            for (let i = 0; i < 2; i++) {
+              leases.push(
+                await runtime.acquireNode({
+                  originPoolId: '__virtual_gemini__',
+                  apiKeyKind: 'master',
+                  ownerScope: { type: 'platform' },
+                  allowedNodeKeys: [`gemini_env:${id}`],
+                  nodeTypes: ['gemini_env'],
+                  model,
+                  modelFamily: 'gemini',
+                  protocol: 'google.gemini',
+                  sessionId: crypto.randomUUID(),
+                  noQueue: true,
+                }),
+              )
+            }
+          } finally {
+            for (const lease of leases) await runtime.releaseLease(lease.lease_id, 'aborted')
+          }
         }
       } finally {
-        for (const lease of leases) await runtime.releaseLease(lease.lease_id, 'aborted')
+        await runtime.shutdown({ drain: false, stopProcess: true })
+        fs.rmSync(dir, { recursive: true, force: true })
       }
-    }
-  } finally {
-    await runtime.shutdown({ drain: false, stopProcess: true })
-    fs.rmSync(dir, { recursive: true, force: true })
+    })
   }
-})
+}
 
 test('local tool failure after streamed output releases the lease without retry or health penalty', async () => {
   const failures = []
@@ -604,5 +621,70 @@ test('upstream failures and other invalid output retain health attribution', asy
     assert.equal(failures[0].http_status, status)
     assert.equal(failures[0].error_class, expectedClass)
     assert.equal(circuitFailures.length, 1)
+  }
+})
+
+test('local required-tool validation remains request-scoped with usage and no retries', async () => {
+  for (const tool_choice of [
+    'required',
+    { type: 'function', name: 'known' },
+    { type: 'allowed_tools', mode: 'required', tools },
+  ]) {
+    for (const parts of [[], [{ text: 'synthetic answer' }]]) {
+      for (const stream of [false, true]) {
+        const failures = []
+        const completed = []
+        const f = fixture({
+          runtime: createMockSchedulerRuntime({
+            onSwitch: () => assert.fail('required-tool validation must not retry'),
+            onRelease: ({ payload }) => failures.push(payload),
+          }),
+          envIds: ['a', 'b'],
+          attemptsRepo: { complete: (_id, _attempt, result) => completed.push(result) },
+          poolScheduler: { unitCircuit: { recordFailure: () => assert.fail('must not penalize the circuit') } },
+          frames: [
+            frame({
+              candidates: [{ content: { role: 'model', parts }, finishReason: 'STOP' }],
+              usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+            }),
+          ],
+        })
+        const res = await f.call(requestBody({ tool_choice, stream }))
+        assert.equal(res.status, stream ? 200 : 502)
+        assert.match(res.text, /gemini_tool_call_required/)
+        assert.equal(f.calls, 1)
+        assert.equal(failures.length, 1)
+        assert.equal(failures[0].http_status, 200)
+        assert.equal(failures[0].error_class, 'request_protocol')
+        assert.equal(failures[0].outcome, 'error')
+        assert.equal(completed[0].errorScope, 'request')
+        assert.equal(f.logs[0].usage.output_tokens, 5)
+      }
+    }
+  }
+})
+
+test('upstream required-tool error names cannot impersonate a local validator', async () => {
+  for (const status of [502, 504]) {
+    const failures = []
+    const slotPrefs = createGeminiSlotPrefs()
+    const f = fixture({
+      slotPrefs,
+      runtime: createMockSchedulerRuntime({ onRelease: ({ payload }) => failures.push(payload) }),
+      frames: [
+        frame({
+          error: {
+            code: status,
+            status: 'gemini_tool_call_required',
+            localError: true,
+            details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'gemini_tool_call_required' }],
+          },
+        }),
+      ],
+    })
+    await f.call(requestBody({ tool_choice: 'required' }))
+    assert.equal(failures[0].http_status, status)
+    assert.equal(failures[0].error_class, status === 504 ? 'timeout' : 'server5xx')
+    if (status === 502) assert.equal(slotPrefs.resolved('env-validation').unschedulable?.reason, 'upstream_502')
   }
 })
