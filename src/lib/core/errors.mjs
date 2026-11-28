@@ -604,7 +604,7 @@ function sanitizeInterruptedAt(value) {
 }
 
 /**
- * Strictly allowlist and bound scalar diagnostic metadata persisted onto normal
+ * Strictly allowlist and bound diagnostic scalars and scheduler exclusion counts on normal
  * `usage_logs` and `request_attempts` rows. Drops arbitrary/nested fields,
  * raw prompts, and secret-shaped tokens.
  */
@@ -615,6 +615,21 @@ export function sanitizeErrorDetailsForLog(rawDetails, { status = null, upstream
   if (upType) out.upstream_type = upType
   const upCode = sanitizeErrorToken(src.upstream_code, 128)
   if (upCode) out.upstream_code = upCode
+  // Persist exclusion counts without node identities, policy text or raw scheduler details.
+  if (
+    src.scheduler_exclusions &&
+    typeof src.scheduler_exclusions === 'object' &&
+    !Array.isArray(src.scheduler_exclusions)
+  ) {
+    const exclusions = {}
+    for (const [key, count] of Object.entries(src.scheduler_exclusions)) {
+      const reason = sanitizeErrorToken(key, 64)
+      if (!reason || !Number.isSafeInteger(count) || count <= 0) continue
+      Object.defineProperty(exclusions, reason, { value: count, enumerable: true, configurable: true })
+      if (Object.keys(exclusions).length >= 8) break
+    }
+    if (Object.keys(exclusions).length) out.scheduler_exclusions = exclusions
+  }
   if (typeof src.retryable === 'boolean') out.retryable = src.retryable
 
   if (Number(status) === 410) {
@@ -665,6 +680,8 @@ export function sanitizeErrorDetailsForLog(rawDetails, { status = null, upstream
     const compact = {}
     for (const key of [
       'upstream_type',
+      'upstream_code',
+      'scheduler_exclusions',
       'retryable',
       'reason',
       'prior_reason',
@@ -677,7 +694,12 @@ export function sanitizeErrorDetailsForLog(rawDetails, { status = null, upstream
       'risk_bucket',
       'punishment',
     ]) {
-      if (Object.hasOwn(out, key)) compact[key] = out[key]
+      if (
+        Object.hasOwn(out, key) &&
+        Buffer.byteLength(JSON.stringify({ ...compact, [key]: out[key] }), 'utf8') <= ERROR_DETAILS_MAX_BYTES
+      ) {
+        compact[key] = out[key]
+      }
     }
     return Object.keys(compact).length ? compact : null
   }

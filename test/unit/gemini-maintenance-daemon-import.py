@@ -19,6 +19,7 @@ class GeminiMaintenanceDaemonImportTests(unittest.TestCase):
         scripts = Path(tmp.name) / "scripts"
         scripts.mkdir()
         shutil.copy2(DAEMON, scripts / "gemini-maintenance.py")
+        shutil.copy2(ROOT / "scripts/gemini_agy_patch.py", scripts / "gemini_agy_patch.py")
         if include_apparmor:
             shutil.copy2(APPARMOR, scripts / "gemini_host_apparmor.py")
         return scripts

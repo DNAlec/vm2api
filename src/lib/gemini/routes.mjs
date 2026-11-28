@@ -8,6 +8,7 @@ import { formatHealthSse, synthesizeProtocolResponse } from '../admin/health-pro
 import { summarizeBody } from '../admin/request-log.mjs'
 import { filterModelsForPoolAccess, keyTierPolicyFromRecord, resolvePoolAccessForKey } from '../admin/key-scope.mjs'
 import { isDbOpen } from '../db/database.mjs'
+import { sanitizeErrorDetailsForLog, sanitizeErrorToken } from '../core/errors.mjs'
 import { requestedPoolIdFromHeaders } from '../protocol/pool-prompt-policy.mjs'
 import { PLATFORM_SCOPE, normalizeOwnerId, ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import {
@@ -2438,11 +2439,19 @@ export function createGeminiPublicHandler({
         body = await readBody(req, bodyLimit)
       } catch (error) {
         const status = error?.status || 400
-        logBag.error_code = 'invalid_json'
-        logBag.error_message = 'Invalid JSON request body.'
+        const bodyError = error?.body?.error || error
+        const code = status === 413 ? 'body_too_large' : bodyError?.code || 'request_body_error'
+        const message =
+          status === 413
+            ? `Request body exceeds limit of ${bodyLimit} bytes.`
+            : code === 'invalid_json'
+              ? 'Invalid JSON request body.'
+              : 'Could not read request body.'
+        logBag.error_code = code
+        logBag.error_message = message
         logBag.final_state = 'failed'
         logBag.attempt_count = 0
-        return respondJson(status, protocolErrorBody(protocol, status, 'invalid_json', 'Invalid JSON request body.'))
+        return respondJson(status, protocolErrorBody(protocol, status, code, message))
       }
     }
     if (activeLogCtx?.mode === 'debug' && logBag.inbound_body == null) {
@@ -2807,6 +2816,30 @@ export function createGeminiPublicHandler({
 
     const applyErrorLog = (error) => {
       if (!error || typeof error !== 'object') return
+      if (error.explain || error.upstreamReason || error.upstreamCode) {
+        // Internal diagnostics only; never attach scheduler topology to public errors.
+        logBag.hop_meta = {
+          ...logBag.hop_meta,
+          ...(error.explain ? { scheduler_explain: error.explain } : {}),
+          ...(error.upstreamReason ? { upstream_reason: error.upstreamReason } : {}),
+          ...(error.upstreamCode ? { upstream_code: error.upstreamCode } : {}),
+        }
+        const exclusions = Object.create(null)
+        for (const entry of Array.isArray(error.explain?.excluded) ? error.explain.excluded : []) {
+          const reason = sanitizeErrorToken(entry?.reason, 64)
+          if (reason) exclusions[reason] = (exclusions[reason] || 0) + 1
+        }
+        logBag.error_details = sanitizeErrorDetailsForLog(
+          {
+            ...logBag.error_details,
+            upstream_code: error.upstreamCode,
+            reason: error.upstreamReason || error.explain?.reason,
+            retry_after_sec: error.retryAfter,
+            scheduler_exclusions: exclusions,
+          },
+          { status: error.status },
+        )
+      }
       if (Number.isInteger(error.attemptCount)) logBag.attempt_count = error.attemptCount
       if (Number.isInteger(error.upstreamStatus)) logBag.upstream_status = error.upstreamStatus
       if (error.accountId) {
