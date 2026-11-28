@@ -59,6 +59,7 @@ import { mergeBatchGroupConfig } from '../pool/batch-group.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy, vmQuotaOverrideOf, vmQuotaView } from '../pool/vm-quota-override.mjs'
 import { GATE_OPEN, gatePolicyFields, gateZone, quotaGateOf } from '../pool/quota-gate.mjs'
 import { guardUsageTier, inferClaudeTier } from '../pool/claude-tier.mjs'
+import { fableRequiresMaxEnabled, slotDeniesFableForPlan } from '../pool/slot-model-gate.mjs'
 import { listQuotaFromHeaders, isOfficialWindowLimited } from '../pool/quota-window.mjs'
 import { lastClosedWindow } from '../pool/window-history.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
@@ -706,6 +707,7 @@ export async function buildDashboard({
   } catch {}
   const active = getActiveVmId(cfg.paths.project)
   const pool = poolScheduler?.snapshot?.() || {}
+  const nodePenalties = poolScheduler?.nodePenalties?.() || null
   const poolSnap = snapshotPool(proxyPool)
   const listed = listVms(cfg.paths.project, routingConfig)
   const liveById = await collectLivePanelCredentials(cfg.paths.project, listed)
@@ -717,6 +719,7 @@ export async function buildDashboard({
     enrichVm(v, accountQuota, active, {
       routingConfig,
       pool,
+      nodePenalties,
       poolSnap,
       liveById,
       projectRoot: cfg.paths.project,
@@ -856,6 +859,7 @@ export async function buildVmList({
   } catch {}
   const active = getActiveVmId(cfg.paths.project)
   const pool = poolScheduler?.snapshot?.() || {}
+  const nodePenalties = poolScheduler?.nodePenalties?.() || null
   const poolSnap = snapshotPool(proxyPool)
   const listed = filterVmsForPanel(listVms(cfg.paths.project, routingConfig), { role, userId: ownerUserId })
   const liveById = await collectLivePanelCredentials(cfg.paths.project, listed)
@@ -864,6 +868,7 @@ export async function buildVmList({
     enrichVm(v, accountQuota, active, {
       routingConfig,
       pool,
+      nodePenalties,
       poolSnap,
       liveById,
       projectRoot: cfg.paths.project,
@@ -922,6 +927,7 @@ export async function buildVmDetail({
   }
   const active = getActiveVmId(cfg.paths.project)
   const pool = poolScheduler?.snapshot?.() || {}
+  const nodePenalties = poolScheduler?.nodePenalties?.() || null
   const poolSnap = snapshotPool(proxyPool)
   const listed = [summarizeVm(vm, cfg.paths.project, routingConfig)]
   const liveById = await collectLivePanelCredentials(cfg.paths.project, listed, { cacheMs: 0 })
@@ -929,6 +935,7 @@ export async function buildVmDetail({
   const summary = enrichVm(listed[0], accountQuota, active, {
     routingConfig,
     pool,
+    nodePenalties,
     poolSnap,
     liveById,
     projectRoot: cfg.paths.project,
@@ -1725,6 +1732,7 @@ export async function snapshotAccountPool({
   } catch {}
   const active = getActiveVmId(cfg.paths.project)
   const pool = poolScheduler?.snapshot?.() || {}
+  const nodePenalties = poolScheduler?.nodePenalties?.() || null
   const poolSnap = snapshotPool(proxyPool)
   const listed = listVms(cfg.paths.project, routingConfig)
   let liveById = null
@@ -1738,6 +1746,7 @@ export async function snapshotAccountPool({
     enrichVm(v, accountQuota, active, {
       routingConfig,
       pool,
+      nodePenalties,
       poolSnap,
       liveById,
       projectRoot: cfg.paths.project,
@@ -2049,6 +2058,9 @@ function enrichVm(v, accountQuota, active, extras = {}) {
   )
   const fablePool = fablePoolFields(acc, runtime, extras.pool || {}, extras.routingConfig || {}, v)
   const isCodex = isCodexVm(v)
+  // Rust kin-scheduler's own node_cooldown (e.g. content-filter refusals) never reaches
+  // `runtime`, yet it keeps the slot out of dispatch: read it as a cooldown here too.
+  const nodePenalty = isCodex ? null : extras.nodePenalties?.get(String(v.id)) || null
   const scheduleLevel = isCodex
     ? codexScheduleLevel(v)
     : resolveCredentialScheduleLevel({ manualLevel: v.schedule_level_manual, unified: acc?.unified || {} })
@@ -2134,12 +2146,14 @@ function enrichVm(v, accountQuota, active, extras = {}) {
       v.claude?.temp_unschedulable_until ||
       v.temp_unschedulable_until ||
       v.cooldown_until ||
+      nodePenalty?.until ||
       null,
     cooldownReason:
       runtime?.cooldown_reason ||
       v.claude?.temp_unschedulable_reason ||
       v.temp_unschedulable_reason ||
       v.cooldown_reason ||
+      (nodePenalty ? `node_cooldown:${nodePenalty.reason}` : null) ||
       null,
   })
   const activeHours = v.active_hours || null
@@ -2175,6 +2189,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     v.claude?.temp_unschedulable_until ||
     v.temp_unschedulable_until ||
     v.cooldown_until ||
+    nodePenalty?.until ||
     availability.until ||
     null
   // 内核故障（watchdog 恢复预算耗尽）只在内存里：调度器跳过该槽，但列表/
@@ -2188,6 +2203,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     v.claude?.temp_unschedulable_reason ||
     v.temp_unschedulable_reason ||
     v.cooldown_reason ||
+    (nodePenalty ? `node_cooldown:${nodePenalty.reason}` : null) ||
     availability.reason ||
     null
   const circuit = isCodex ? null : circuitViewFor(v, extras.projectRoot)
@@ -2361,11 +2377,19 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     usage_has_fable: isCodex ? null : q.usage_has_fable,
     fable_credits_required: isCodex ? null : q.fable_credits_required || null,
     // pool.fable_requires_max: this slot never gets Fable because it is not Max.
-    fable_requires_max: !isCodex && extras.routingConfig?.pool?.fable_requires_max === true && tierKey !== 'max',
+    // Same predicate dispatch uses (scheduler-runtime -> slotAllowsModel).
+    fable_requires_max: slotDeniesFableForPlan({
+      vm: v,
+      account: acc,
+      fableRequiresMax: fableRequiresMaxEnabled(extras.routingConfig),
+    }),
     availability,
     cred_status: credStatusFromAvailability(availability),
     cooldown_until: Number(restrictionUntil) > Date.now() ? Number(restrictionUntil) : null,
     cooldown_reason: Number(restrictionUntil) > Date.now() ? restrictionReason : null,
+    node_cooldown: nodePenalty
+      ? { until: nodePenalty.until, reason: nodePenalty.reason, left_ms: Math.max(0, nodePenalty.until - Date.now()) }
+      : null,
     schedule_state: triad.schedule_state,
     restriction_reason: triad.restriction_reason,
     restriction_until: triad.restriction_until,
