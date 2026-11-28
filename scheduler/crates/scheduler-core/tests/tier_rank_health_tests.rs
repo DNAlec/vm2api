@@ -647,6 +647,7 @@ async fn request_faults_never_cool_or_sink_node() {
         ErrorClass::JevBlocked,
         ErrorClass::Refusal,
         ErrorClass::ContextTooLong,
+        ErrorClass::RequestProtocol,
         ErrorClass::Client4xx,
     ]
     .iter()
@@ -1673,6 +1674,11 @@ async fn aborted_timeout_and_request_fault_releases_keep_session_stick() {
     release_ok(&eng, &r0.lease_id);
 
     let cases = [
+        (
+            ReleaseOutcome::Error,
+            Some(200u16),
+            Some(ErrorClass::RequestProtocol),
+        ),
         (ReleaseOutcome::Aborted, None, None),
         (ReleaseOutcome::Timeout, None, None),
         (ReleaseOutcome::Error, Some(400u16), None),
@@ -1811,4 +1817,53 @@ async fn idempotency_cache_rejects_expired_lease_before_reaping() {
         ErrorCode::LeaseNotFound
     );
     release_ok(&eng, &lease.lease_id);
+}
+
+#[tokio::test]
+async fn request_protocol_failure_does_not_clear_an_existing_cooldown_or_amplify_it() {
+    let pool = PoolConfig {
+        id: CompactString::const_new("p1"),
+        members: vec![member("claude_vm:n1", "n1", MemberRole::Active, 1)],
+        ..Default::default()
+    };
+    let eng = boot_pool(
+        EngineOptions::default(),
+        pool,
+        vec![node_cfg("claude_vm:n1", "n1", 8, 10, 4, 4)],
+        vec![],
+    );
+    let lease = eng.acquire(req("timeout", "p1", "m", "s1")).await.unwrap();
+    eng.release(ReleaseRequest {
+        lease_id: lease.lease_id,
+        outcome: ReleaseOutcome::Timeout,
+        http_status: Some(504),
+        error_class: Some(ErrorClass::Timeout),
+        error_signature: None,
+        error_message: None,
+        retry_after_sec: None,
+        ttft_ms: None,
+        tokens_used: None,
+        quota_headers: None,
+    });
+    let before = eng.node_health_snapshot("claude_vm:n1");
+    assert!(before.0 > 0, "real timeouts still cool the node");
+    for (i, status) in [200, 502].into_iter().enumerate() {
+        let probe = eng
+            .acquire(req(&format!("probe-{i}"), "p1", "m", "s1"))
+            .await
+            .unwrap();
+        eng.release(ReleaseRequest {
+            lease_id: probe.lease_id,
+            outcome: ReleaseOutcome::Error,
+            http_status: Some(status),
+            error_class: Some(ErrorClass::RequestProtocol),
+            error_signature: Some("gemini_inference_invalid_output".to_owned()),
+            error_message: None,
+            retry_after_sec: None,
+            ttft_ms: None,
+            tokens_used: None,
+            quota_headers: None,
+        });
+        assert_eq!(eng.node_health_snapshot("claude_vm:n1"), before);
+    }
 }

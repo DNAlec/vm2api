@@ -19,6 +19,7 @@ import {
   createGeminiRestoreTransform,
   parseInboundToGemini,
 } from '../../src/lib/protocol/gemini-convert.mjs'
+import { createSchedulerRuntime } from '../../src/lib/scheduler/scheduler-runtime.mjs'
 import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
 import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 
@@ -52,15 +53,22 @@ function fixture({
   bodyReader = readBody,
   requestLog,
   slotPrefs,
+  envIds = ['env-validation'],
+  poolScheduler,
+  attemptsRepo,
+  getRoutingConfig,
 } = {}) {
   let calls = 0
   const logs = []
   const scheduler = createGeminiScheduler({
     schedulerRuntime: runtime,
     slotPrefs,
-    callHost: async (op) => {
+    poolScheduler,
+    attemptsRepo,
+    getRoutingConfig,
+    callHost: async (op, args) => {
       const env = {
-        id: 'env-validation',
+        id: args?.id || envIds[0],
         proxy_id: 'px',
         auth_method: 'oauth',
         auth_state: 'authorized',
@@ -68,7 +76,7 @@ function fixture({
         models: [model],
         capabilities: [...FULL_GEMINI_CAPABILITIES],
       }
-      if (op === 'list') return { payload_state: 'installed', environments: [env] }
+      if (op === 'list') return { payload_state: 'installed', environments: envIds.map((id) => ({ ...env, id })) }
       if (op === 'get') return env
       throw new Error(`unexpected host operation: ${op}`)
     },
@@ -92,6 +100,7 @@ function fixture({
   })
   return {
     logs,
+    scheduler,
     get calls() {
       return calls
     },
@@ -442,4 +451,158 @@ test('actual upstream SSE 502 still follows the configured account suspension po
   await f.call(requestBody())
   assert.equal(f.logs[0].upstream_status, 502)
   assert.equal(slotPrefs.resolved('env-validation').unschedulable?.reason, 'upstream_502')
+})
+
+test('local tool validation is request-scoped for release and failover without tripping Node circuit', async () => {
+  for (const switches of [0, 1, 3]) {
+    const failures = []
+    const completed = []
+    const circuitFailures = []
+    const runtime = createMockSchedulerRuntime({
+      onSwitch: ({ body }) => failures.push(body.failure),
+      onRelease: ({ payload }) => failures.push(payload),
+    })
+    const f = fixture({
+      runtime,
+      envIds: ['a', 'b', 'c', 'd'],
+      frames: [frame(chunk(['not_declared']))],
+      getRoutingConfig: () => ({ gemini: { failover: { max_account_switches: switches } } }),
+      poolScheduler: { unitCircuit: { recordFailure: (key) => circuitFailures.push(key) } },
+      attemptsRepo: { complete: (_id, _attempt, result) => completed.push(result) },
+    })
+    const res = await f.call(requestBody())
+    assert.equal(res.status, 502)
+    assert.equal(f.calls, switches + 1, 'the configured switch budget still bounds attempts')
+    assert.equal(failures.length, switches + 1)
+    for (const failure of failures) {
+      assert.equal(failure.http_status, 200)
+      assert.equal(failure.error_class, 'request_protocol')
+      assert.equal(failure.error_signature, 'gemini_inference_invalid_output')
+    }
+    assert.deepEqual(circuitFailures, [])
+    assert.equal(completed.length, switches + 1)
+    assert.ok(completed.every((result) => result.errorScope === 'request'))
+  }
+})
+
+test('real Rust scheduler keeps all accounts available after local tool failures across the pool', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-tool-health-'))
+  const envIds = ['a', 'b', 'c', 'd']
+  let f
+  const runtime = createSchedulerRuntime({
+    getDb: () => null,
+    getVms: () => [],
+    getRoutingConfig: () => ({}),
+    geminiScheduler: { listEnvironments: () => f.scheduler.listEnvironments() },
+    telemetryIntervalMs: 0,
+    clientOptions: {
+      binPath: process.env.KIN_SCHEDULER_BIN,
+      dataDir: dir,
+      socketPath: path.join(dir, 'scheduler.sock'),
+      tokenPath: path.join(dir, 'token'),
+      capFile: path.join(dir, 'cap.json'),
+    },
+  })
+  const slotPrefs = createGeminiSlotPrefs()
+  f = fixture({ runtime, slotPrefs, envIds, frames: [frame(chunk(['not_declared']))] })
+  try {
+    await f.scheduler.catalog()
+    await runtime.start({ waitMs: 5000, startLoops: false })
+    await runtime.pushTelemetryNow()
+    const res = await f.call(requestBody())
+    assert.equal(res.status, 502, res.text)
+    assert.equal(f.calls, 4, 'all four accounts were attempted once')
+    for (const id of envIds) {
+      assert.equal(slotPrefs.resolved(id).unschedulable, null)
+      const leases = []
+      try {
+        // A cooled node can admit one probe; two simultaneous leases rule that out.
+        for (let i = 0; i < 2; i++) {
+          leases.push(
+            await runtime.acquireNode({
+              originPoolId: '__virtual_gemini__',
+              apiKeyKind: 'master',
+              ownerScope: { type: 'platform' },
+              allowedNodeKeys: [`gemini_env:${id}`],
+              nodeTypes: ['gemini_env'],
+              model,
+              modelFamily: 'gemini',
+              protocol: 'google.gemini',
+              sessionId: crypto.randomUUID(),
+              noQueue: true,
+            }),
+          )
+        }
+      } finally {
+        for (const lease of leases) await runtime.releaseLease(lease.lease_id, 'aborted')
+      }
+    }
+  } finally {
+    await runtime.shutdown({ drain: false, stopProcess: true })
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('local tool failure after streamed output releases the lease without retry or health penalty', async () => {
+  const failures = []
+  const circuitFailures = []
+  const runtime = createMockSchedulerRuntime({
+    onSwitch: () => assert.fail('must not switch after output'),
+    onRelease: ({ payload }) => failures.push(payload),
+  })
+  const f = fixture({
+    runtime,
+    envIds: ['a', 'b'],
+    poolScheduler: { unitCircuit: { recordFailure: (key) => circuitFailures.push(key) } },
+    frames: [
+      frame({ candidates: [{ content: { role: 'model', parts: [{ text: 'synthetic', thought: true }] } }] }),
+      frame(chunk(['not_declared'])),
+    ],
+  })
+  const res = await f.call(requestBody({ stream: true }))
+  assert.equal(res.status, 200)
+  assert.match(res.text, /gemini_inference_invalid_output/)
+  assert.equal(f.calls, 1)
+  assert.equal(failures.length, 1)
+  assert.equal(failures[0].outcome, 'error')
+  assert.equal(failures[0].error_class, 'request_protocol')
+  assert.deepEqual(circuitFailures, [])
+})
+
+test('upstream failures and other invalid output retain health attribution', async () => {
+  for (const [frames, expectedClass, status] of [
+    [[frame({ error: { code: 504, status: 'DEADLINE_EXCEEDED', message: 'idle_timeout' } })], 'timeout', 504],
+    // Matching names (even a supplied marker) in upstream data must not grant a local validation exemption.
+    [
+      [
+        frame({
+          error: {
+            code: 502,
+            status: 'gemini_inference_invalid_output',
+            reason: 'undeclared_tool_call',
+            localError: true,
+          },
+        }),
+      ],
+      'server5xx',
+      502,
+    ],
+    [[], 'unknown', 200],
+  ]) {
+    const failures = []
+    const circuitFailures = []
+    const runtime = createMockSchedulerRuntime({ onRelease: ({ payload }) => failures.push(payload) })
+    const f = fixture({
+      runtime,
+      frames,
+      poolScheduler: { unitCircuit: { recordFailure: (key) => circuitFailures.push(key) } },
+      getRoutingConfig: () => ({ gemini: { failover: { unschedulable_on_502: false } } }),
+    })
+    const res = await f.call(requestBody())
+    assert.ok(res.status >= 500, res.text)
+    assert.equal(failures.length, 1)
+    assert.equal(failures[0].http_status, status)
+    assert.equal(failures[0].error_class, expectedClass)
+    assert.equal(circuitFailures.length, 1)
+  }
 })
