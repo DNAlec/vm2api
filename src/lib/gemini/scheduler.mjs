@@ -1,3 +1,4 @@
+import { markGeminiToolDetailsForLog } from '../core/errors.mjs'
 import { apiKeyGateDetails } from '../admin/api-keys.mjs'
 import crypto from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
@@ -439,7 +440,13 @@ async function consumeStreamResponse(
   let streamError = null
   let sawChunk = false
   let earlyStopped = false
+  const toolDetails = { gemini_tool_decoded: 0, gemini_tool_restored: 0, gemini_tool_allowed_filtered: 0, gemini_tool_decoder_end_reason: 'not_observed', gemini_tool_restored_end_reason: 'not_observed' }
   const emit = (event) => {
+    if (event?.kind === 'tool_call') toolDetails.gemini_tool_restored = Math.min(65535, toolDetails.gemini_tool_restored + 1)
+    if (event?.kind === 'stop') {
+      toolDetails.gemini_tool_restored_end_reason = ['stop', 'tool', 'length', 'stop_sequence', 'filter'].includes(event.stopReason)
+        ? event.stopReason : 'other'
+    }
     const at = now()
     if (event?.kind === 'start') {
       timing.observe({ type: 'message_start' }, at)
@@ -458,6 +465,7 @@ async function consumeStreamResponse(
     onEvent?.(event)
   }
   const restore = createGeminiRestoreTransform(restoreContext, {
+    toolDiagnostics: toolDetails,
     target,
     model,
     onEarlyStop: () => {
@@ -472,6 +480,8 @@ async function consumeStreamResponse(
   const splitter = createSseFrameSplitter((frame) => {
     if (earlyStopped) return
     decoder.decodeSseFrame(frame, (ev) => {
+      if (ev?.kind === 'tool_call') toolDetails.gemini_tool_decoded = Math.min(65535, toolDetails.gemini_tool_decoded + 1)
+      if (ev?.kind === 'stop') toolDetails.gemini_tool_decoder_end_reason = ['stop', 'tool', 'length', 'stop_sequence', 'filter'].includes(ev.stopReason) ? ev.stopReason : 'other'
       if (!earlyStopped) restore.push(ev, emit)
     })
   })
@@ -496,6 +506,8 @@ async function consumeStreamResponse(
       signal?.throwIfAborted()
       splitter.flush()
       decoder.flush?.((ev) => {
+        if (ev?.kind === 'tool_call') toolDetails.gemini_tool_decoded = Math.min(65535, toolDetails.gemini_tool_decoded + 1)
+        if (ev?.kind === 'stop') toolDetails.gemini_tool_decoder_end_reason = ['stop', 'tool', 'length', 'stop_sequence', 'filter'].includes(ev.stopReason) ? ev.stopReason : 'other'
         if (!earlyStopped) restore.push(ev, emit)
       })
       restore.flush(emit)
@@ -529,6 +541,7 @@ async function consumeStreamResponse(
     if (streamError.localError === true) err.localError = true
     if (streamError.reason) err.upstreamReason = streamError.reason
     if (streamError.code) err.upstreamCode = streamError.code
+    if (streamError.localError === true && streamError.reason === 'undeclared_tool_call') err.details = markGeminiToolDetailsForLog(toolDetails)
     err.timing = timing.snapshot()
     err.usage = result.usage
     throw err
@@ -551,6 +564,7 @@ async function consumeStreamResponse(
       ? `Upstream completed without calling required function "${requiredChoice.slice(5)}".`
       : FAILURES.gemini_tool_call_required[1]
     const err = fail(502, 'gemini_tool_call_required', message)
+    err.details = markGeminiToolDetailsForLog(toolDetails)
     err.localError = true
     if (Number.isInteger(response.statusCode)) err.upstreamStatus = response.statusCode
     err.timing = timing.snapshot()

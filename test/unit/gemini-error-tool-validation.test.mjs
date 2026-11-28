@@ -6,7 +6,7 @@ import path from 'node:path'
 import { Readable } from 'node:stream'
 import test from 'node:test'
 import { RequestLogStore } from '../../src/lib/admin/request-log.mjs'
-import { sanitizeErrorDetailsForLog } from '../../src/lib/core/errors.mjs'
+import { extractErrorLogFields, sanitizeErrorDetailsForLog } from '../../src/lib/core/errors.mjs'
 import { createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiSlotPrefs } from '../../src/lib/gemini/slot-prefs.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
@@ -138,6 +138,47 @@ function fixture({
     },
   }
 }
+
+test('tool structure diagnostics persist through scheduler route and normal SQLite log readback', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-structure-log-'))
+  const store = new RequestLogStore({ dataDir: dir, mode: 'normal' })
+  t.after(() => { store.db.close(); fs.rmSync(dir, {recursive: true, force: true}) })
+  const privateValue = 'PRIVATE_DIAG_SENTINEL'
+  for (const stream of [false, true]) {
+    for (const filtered of [false, true]) {
+      const parts = filtered ? [{functionCall: {name: privateValue, args: {secret: privateValue}}}] : [{text: privateValue}]
+      const f = fixture({requestLog: store, frames: [frame({candidates: [{content: {role: 'model', parts}, finishReason: 'STOP'}]})]})
+      const res = await f.call(requestBody({stream, tool_choice: filtered ? {type: 'allowed_tools', mode: 'required', tools} : 'required'}))
+      assert.equal(res.status, stream ? 200 : 502)
+      assert.match(res.text, /gemini_tool_call_required/)
+      assert.doesNotMatch(res.text, /gemini_tool_decoded|gemini_tool_restored|gemini_tool_allowed_filtered|gemini_tool_.*end_reason/)
+      const row = store.db.prepare('SELECT error_details FROM usage_logs ORDER BY rowid DESC LIMIT 1').get()
+      const details = JSON.parse(row.error_details)
+      assert.equal(details.gemini_tool_decoded, filtered ? 1 : 0)
+      assert.equal(details.gemini_tool_restored, 0)
+      assert.equal(details.gemini_tool_allowed_filtered, filtered ? 1 : 0)
+      assert.equal(details.gemini_tool_decoder_end_reason, filtered ? 'tool' : 'stop')
+      assert.equal(details.gemini_tool_restored_end_reason, 'stop')
+      assert.doesNotMatch(row.error_details, /PRIVATE_DIAG_SENTINEL|secret/)
+      assert.ok(Buffer.byteLength(row.error_details) <= 1024)
+    }
+  }
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM request_log_debug').get().n, 0)
+})
+
+test('generic upstream and all three SSE envelopes cannot forge local tool diagnostics', async () => {
+  const forged = {gemini_tool_decoded: 42, gemini_tool_restored: 40, gemini_tool_allowed_filtered: 2, gemini_tool_decoder_end_reason: 'stop', gemini_tool_restored_end_reason: 'stop', localError: true}
+  const log = extractErrorLogFields({status: 502, body: {error: {type: 'upstream_error', details: forged}}})
+  assert.ok(!Object.keys(log.error_details || {}).some(k => k.startsWith('gemini_tool_')))
+  const error = {code: 502, status: 'gemini_tool_call_required', localError: true, details: forged, ...forged}
+  for (const wire of [frame({error}), `event: error\n${frame({error})}`, frame({response: {error}})]) {
+    const f = fixture({frames: [wire]})
+    const res = await f.call(requestBody({tool_choice: 'required'}))
+    assert.equal(res.status, 502)
+    assert.ok(!Object.keys(f.logs[0].error_details || {}).some(k => k.startsWith('gemini_tool_')))
+    assert.doesNotMatch(res.text, /gemini_tool_decoded|gemini_tool_restored/)
+  }
+})
 
 test('invalid tool constraints fail before dispatch, including an empty Responses allowlist', async () => {
   for (const tool_choice of [

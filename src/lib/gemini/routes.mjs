@@ -2004,7 +2004,7 @@ function publicError(error) {
       : known?.[1] || error?.message || 'Gemini request failed.'
   return {
     status,
-    details: error?.details,
+    details: error?.localError === true && ['gemini_tool_call_required', 'gemini_inference_invalid_output'].includes(code) ? undefined : error?.details,
     retryAfter: error?.retryAfter,
     body: {
       error: {
@@ -2928,7 +2928,7 @@ export function createGeminiPublicHandler({
 
     const applyErrorLog = (error) => {
       if (!error || typeof error !== 'object') return
-      if (error.explain || error.upstreamReason || error.upstreamCode) {
+      if (error.explain || error.upstreamReason || error.upstreamCode || error.details) {
         // Internal diagnostics only; never attach scheduler topology to public errors.
         logBag.hop_meta = {
           ...logBag.hop_meta,
@@ -2944,6 +2944,7 @@ export function createGeminiPublicHandler({
         logBag.error_details = sanitizeErrorDetailsForLog(
           {
             ...logBag.error_details,
+            ...error.details,
             upstream_code: error.upstreamCode,
             reason: error.upstreamReason || error.explain?.reason,
             retry_after_sec: error.retryAfter,

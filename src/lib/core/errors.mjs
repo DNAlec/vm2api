@@ -580,6 +580,12 @@ const SECRET_PREFIX_RE = /^(?:sk-(?:ant|kin|vm)-|AIza|eyJ)/i
 const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/
 const GENERIC_UPSTREAM_TYPES = new Set(['error', 'api_error', 'upstream_error'])
 const ERROR_DETAILS_MAX_BYTES = 1024
+// In-process provenance only: JSON/upstream fields cannot mint this symbol.
+const GEMINI_TOOL_DETAILS_LOCAL = Symbol('geminiToolDetailsLocal')
+
+export function markGeminiToolDetailsForLog(details) {
+  return { ...details, [GEMINI_TOOL_DETAILS_LOCAL]: true }
+}
 
 /** Strict bounded identifier sanitizer for log error taxonomy fields (never prompts or secrets). */
 export function sanitizeErrorToken(value, maxLen = 128) {
@@ -612,6 +618,15 @@ export function sanitizeErrorDetailsForLog(rawDetails, { status = null, upstream
   const src = rawDetails && typeof rawDetails === 'object' && !Array.isArray(rawDetails) ? rawDetails : {}
   const out = {}
   const upType = sanitizeErrorToken(src.upstream_type ?? upstreamType, 128)
+  if (src[GEMINI_TOOL_DETAILS_LOCAL] === true) {
+    for (const key of ['gemini_tool_decoded', 'gemini_tool_restored', 'gemini_tool_allowed_filtered']) {
+      if (Number.isInteger(src[key]) && src[key] >= 0 && src[key] <= 65535) out[key] = src[key]
+    }
+    for (const key of ['gemini_tool_decoder_end_reason', 'gemini_tool_restored_end_reason']) {
+      if (['not_observed', 'other', 'stop', 'tool', 'length', 'stop_sequence', 'filter'].includes(src[key])) out[key] = src[key]
+    }
+    Object.defineProperty(out, GEMINI_TOOL_DETAILS_LOCAL, { value: true, enumerable: true })
+  }
   if (upType) out.upstream_type = upType
   const upCode = sanitizeErrorToken(src.upstream_code, 128)
   if (upCode) out.upstream_code = upCode
@@ -678,7 +693,13 @@ export function sanitizeErrorDetailsForLog(rawDetails, { status = null, upstream
   if (!Object.keys(out).length) return null
   if (Buffer.byteLength(JSON.stringify(out), 'utf8') > ERROR_DETAILS_MAX_BYTES) {
     const compact = {}
+    if (src[GEMINI_TOOL_DETAILS_LOCAL] === true) Object.defineProperty(compact, GEMINI_TOOL_DETAILS_LOCAL, { value: true, enumerable: true })
     for (const key of [
+      'gemini_tool_decoded',
+      'gemini_tool_restored',
+      'gemini_tool_allowed_filtered',
+      'gemini_tool_decoder_end_reason',
+      'gemini_tool_restored_end_reason',
       'upstream_type',
       'upstream_code',
       'scheduler_exclusions',

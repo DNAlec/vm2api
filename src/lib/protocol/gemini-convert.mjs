@@ -4125,7 +4125,7 @@ function unwrapStructuredText(rawText, responseFormat) {
  */
 export function createGeminiRestoreTransform(
   restoreContext,
-  { target = 'antigravity', model = '', onEarlyStop = null } = {},
+  { target = 'antigravity', model = '', onEarlyStop = null, toolDiagnostics = null } = {},
 ) {
   const ctx = isPlainObject(restoreContext) ? restoreContext : null
   if (!ctx) {
@@ -4279,6 +4279,7 @@ export function createGeminiRestoreTransform(
             !ctx.allowedToolNames.has(event.name) &&
             !ctx.allowedToolNames.has(cleanName)
           ) {
+            if (toolDiagnostics) toolDiagnostics.gemini_tool_allowed_filtered = Math.min(65535, toolDiagnostics.gemini_tool_allowed_filtered + 1)
             return
           }
         }
