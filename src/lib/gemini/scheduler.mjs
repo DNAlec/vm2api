@@ -12,6 +12,7 @@ import {
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import { isGeminiModelEnabled, isGeminiSeriesId, resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
 import { classifyAntigravityModel, indexAccountModelCatalog, resolveUpstreamModel } from './model-catalog.mjs'
+import { evaluateGeminiQuota, projectGeminiQuotaAccount, quotaRetryAfter } from './quota-admission.mjs'
 import { createDirectCragClient } from './direct-client.mjs'
 import { callGeminiHost, callGeminiHostStream } from './routes.mjs'
 import { DEFAULT_GEMINI_ROUTING, normalizeGeminiRouting } from './routing-config.mjs'
@@ -509,7 +510,9 @@ async function consumeStreamResponse(
                   ? 'gemini_invalid_request'
                   : 'gemini_inference_failed'
     const err = fail(streamError.status || FAILURES[code][0], code, streamError.message)
-    if (Number.isInteger(streamError.status)) err.upstreamStatus = streamError.status
+    // A gateway-generated validation status is not the upstream HTTP status.
+    const upstreamStatus = streamError.localError === true ? response.statusCode : streamError.status
+    if (Number.isInteger(upstreamStatus)) err.upstreamStatus = upstreamStatus
     if (streamError.reason) err.upstreamReason = streamError.reason
     if (streamError.code) err.upstreamCode = streamError.code
     err.timing = timing.snapshot()
@@ -660,6 +663,7 @@ export function createGeminiScheduler({
           currentPolicy().pool.max_concurrency_per_account,
         ),
         models,
+        account: projectGeminiQuotaAccount(environment.account),
         enabled: true,
         healthy,
         schedulable,
@@ -875,6 +879,7 @@ export function createGeminiScheduler({
           schedule_level: account.schedule_level ?? 5,
           max_concurrency: account.max_concurrency ?? DEFAULT_CONCURRENCY,
           models: account.models || [],
+          account: projectGeminiQuotaAccount(account),
           enabled: true,
           healthy: true,
           schedulable: true,
@@ -1242,20 +1247,25 @@ export function createGeminiScheduler({
         }
 
         const ts = now()
-        const isProactivelyExhausted = (account, resolved) => {
-          for (const q of account.quotas || []) {
-            if (!q || typeof q !== 'object') continue
-            if (Number(q.remaining_fraction) !== 0) continue
-            const resetMs = q.reset_at ? Date.parse(q.reset_at) : Number.NaN
-            if (Number.isFinite(resetMs) && resetMs <= ts) continue
-            if (q.model === resolved.publicId || q.model === resolved.upstreamModel) return true
+        const quotaStates = capableAccounts.map(({ account, resolved }) => evaluateGeminiQuota(account, resolved, ts))
+        const dispatchAccounts = capableAccounts.filter((_, index) => !quotaStates[index].exhausted)
+        if (!dispatchAccounts.length) {
+          const exhausted = fail(
+            429,
+            'gemini_quota_exhausted',
+            'All authorized accounts for this model have exhausted their quota.',
+          )
+          exhausted.retryAfter = quotaRetryAfter(quotaStates, ts)
+          exhausted.upstreamReason = 'quota_exhausted'
+          exhausted.explain = {
+            reason: 'quota_exhausted',
+            excluded: capableAccounts.map(({ account }) => ({
+              node_key: formatNodeKey('gemini_env', account.id),
+              reason: 'quota_exhausted',
+            })),
           }
-          return false
+          throw attachAttemptMeta(exhausted)
         }
-        const nonExhaustedCapable = capableAccounts.filter(
-          ({ account, resolved }) => !isProactivelyExhausted(account, resolved),
-        )
-        const dispatchAccounts = nonExhaustedCapable.length ? nonExhaustedCapable : capableAccounts
 
         await ensureEnvironmentsSynced(rt, dispatchAccounts)
 
@@ -1301,6 +1311,7 @@ export function createGeminiScheduler({
           allowedNodeKeys,
           nodeTypes: ['gemini_env'],
           model: String(model || ''),
+          requestedEffort,
           modelFamily: inferModelFamily(model, 'google'),
           protocol: 'google.gemini',
           machineId: inboundIdentity?.machineId || null,
@@ -1323,6 +1334,7 @@ export function createGeminiScheduler({
             throw err
           }
           if (err instanceof SchedulerApiError) {
+            if (err.code === 'gemini_quota_exhausted') throw attachAttemptMeta(known(err))
             if (err.code === 'pool_exhausted') {
               const overloaded = fail(429, 'gemini_pool_overloaded', '号池负载过高，请稍后再试')
               overloaded.retryAfter = err.retryAfterSec || 5
@@ -2100,6 +2112,7 @@ export function createGeminiScheduler({
                 throw switchErr
               }
               if (switchErr instanceof SchedulerApiError) {
+                if (switchErr.code === 'gemini_quota_exhausted') throw attachAttemptMeta(known(switchErr))
                 if (switchErr.code === 'poison_abort' || switchErr.status === 422) {
                   throw switchErr
                 }

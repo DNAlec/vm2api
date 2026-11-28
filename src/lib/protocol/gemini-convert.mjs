@@ -4289,6 +4289,7 @@ export function createGeminiRestoreTransform(
             status: 502,
             code: 'gemini_inference_invalid_output',
             reason: 'undeclared_tool_call',
+            localError: true,
             message: 'Upstream returned an undeclared function call.',
           })
           return

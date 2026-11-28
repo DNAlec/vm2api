@@ -8,6 +8,7 @@ import test from 'node:test'
 import { RequestLogStore } from '../../src/lib/admin/request-log.mjs'
 import { sanitizeErrorDetailsForLog } from '../../src/lib/core/errors.mjs'
 import { createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
+import { createGeminiSlotPrefs } from '../../src/lib/gemini/slot-prefs.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
 import { readBody } from '../../src/lib/http/respond.mjs'
 import {
@@ -45,11 +46,18 @@ function restore(ir, body) {
   return collector.result()
 }
 
-function fixture({ frames = [], runtime = createMockSchedulerRuntime(), bodyReader = readBody, requestLog } = {}) {
+function fixture({
+  frames = [],
+  runtime = createMockSchedulerRuntime(),
+  bodyReader = readBody,
+  requestLog,
+  slotPrefs,
+} = {}) {
   let calls = 0
   const logs = []
   const scheduler = createGeminiScheduler({
     schedulerRuntime: runtime,
+    slotPrefs,
     callHost: async (op) => {
       const env = {
         id: 'env-validation',
@@ -411,4 +419,27 @@ test('required tools retain MAX_TOKENS completion semantics', async () => {
   assert.equal(res.status, 200)
   assert.equal(JSON.parse(res.text).incomplete_details.reason, 'max_output_tokens')
   assert.equal(f.logs[0].final_state, 'verified')
+})
+
+test('local undeclared-tool failures preserve HTTP 200 and do not persist an account suspension', async () => {
+  const slotPrefs = createGeminiSlotPrefs()
+  const f = fixture({ slotPrefs, frames: [frame(chunk(['not_declared']))] })
+  const res = await f.call(requestBody())
+  assert.equal(res.status, 502)
+  assert.equal(JSON.parse(res.text).error.code, 'gemini_inference_invalid_output')
+  assert.equal(f.logs[0].upstream_status, 200)
+  assert.equal(slotPrefs.resolved('env-validation').unschedulable, null)
+  await f.call(requestBody())
+  assert.equal(f.calls, 2, 'the account remains available for subsequent requests')
+})
+
+test('actual upstream SSE 502 still follows the configured account suspension policy', async () => {
+  const slotPrefs = createGeminiSlotPrefs()
+  const f = fixture({
+    slotPrefs,
+    frames: [frame({ error: { code: 502, status: 'BAD_GATEWAY', message: 'upstream failure' } })],
+  })
+  await f.call(requestBody())
+  assert.equal(f.logs[0].upstream_status, 502)
+  assert.equal(slotPrefs.resolved('env-validation').unschedulable?.reason, 'upstream_502')
 })
